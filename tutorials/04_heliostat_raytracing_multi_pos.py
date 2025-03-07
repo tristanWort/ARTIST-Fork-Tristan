@@ -40,7 +40,7 @@ targets_dict = {target.name: target for target in scenario.target_areas.target_a
 
 print("Init aim points:", scenario.heliostat_field.all_aim_points)
 new_aim_points = torch.tensor(data=[
-    targets_dict['receiver'].center.tolist(),
+    targets_dict['multi_focus_tower'].center.tolist(),
     targets_dict['receiver'].center.tolist()
 ], device=device)
 
@@ -49,7 +49,7 @@ scenario.heliostat_field.all_aim_points = new_aim_points
 print("New aim points:", scenario.heliostat_field.all_aim_points)
 
 # Use south sun position
-incident_ray_direction_south = torch.tensor([0.0, -1.0, 0.0, 0.0], device=device)
+incident_ray_direction_south = torch.tensor([0.0, 1.0, 0.0, 0.0], device=device)
 # Align all heliostats
 scenario.heliostat_field.align_surfaces_with_incident_ray_direction(
     incident_ray_direction=incident_ray_direction_south,
@@ -63,7 +63,7 @@ raytracer = HeliostatRayTracer(
 # Perform heliostat-based raytracing.
 final_bitmap = raytracer.trace_rays(
     incident_ray_direction=incident_ray_direction_south,
-    target_area=targets_dict['receiver'],
+    target_area=targets_dict['multi_focus_tower'],
     device=device
 )
 print(final_bitmap.max())
@@ -73,7 +73,7 @@ plt.title(f"Flux Density Distribution from rank (heliostat): {rank}")
 plt.savefig(f"AA_new_rank_{rank}_{device.type}.png")
 
 final_bitmap = raytracer.normalize_bitmap(final_bitmap,
-                                          targets_dict['receiver']
+                                          targets_dict['multi_focus_tower']
                                           )
 
 plt.imshow(final_bitmap.cpu().detach(), cmap="inferno")
