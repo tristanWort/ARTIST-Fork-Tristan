@@ -160,7 +160,7 @@ class HeliostatField(torch.nn.Module):
         number_of_heliostats = len(config_file[config_dictionary.heliostat_key])
 
         # TODO 10000 ersetzen
-        number_of_surface_points_per_heliostat = 10000
+        number_of_surface_points_per_heliostat = 40000
         all_heliostat_names = []
         all_heliostat_positions = torch.zeros((number_of_heliostats, 4), device=device)
         all_aim_points = torch.zeros((number_of_heliostats, 4), device=device)
