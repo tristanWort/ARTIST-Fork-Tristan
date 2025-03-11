@@ -11,19 +11,18 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 from typing import Union, Literal, List, Tuple
 from pathlib import Path
 
+parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if parent_path not in sys.path:
+    sys.path.append(parent_path) 
 from artist.scenario import Scenario
 from artist.raytracing import raytracing_utils
 from artist.raytracing.heliostat_tracing import HeliostatRayTracer
 from artist.util import utils
+
 from calibration_dataset import CalibrationDataLoader
 from util import (get_rigid_body_kinematic_parameters_from_scenario,
                    enu_point_to_target_plane)
 from util import print_gpu_memory_usage
-
-parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if parent_path not in sys.path:
-    sys.path.append(parent_path)
-# from plotting import plot_diff_flux
 from utils.plotting_utils import plot_calibration_result
 
 
@@ -306,27 +305,27 @@ class CalibrationModel(nn.Module):
                     # chds[sample] = chamfer_distance_batch(flux_pred_bitmap.unsqueeze(0), single_batch['flux_image'].unsqueeze(0)).mean()
 
                     #Todo: Function does not map the centers properly yet.
-                    if do_plotting:
-                        center1 = enu_point_to_target_plane(
-                            enu_point=batch['flux_centers'][sample],
-                            target_center = target_area.center,
-                            plane_e = target_area.plane_e,
-                            plane_u = target_area.plane_u,
-                        )
-                        center2 = enu_point_to_target_plane(
-                            enu_point=center_of_mass,
-                            target_center=target_area.center,
-                            plane_e=target_area.plane_e,
-                            plane_u=target_area.plane_u,
-                        )
-                        plot_calibration_result(
-                            bitmap1=batch['flux_images'][sample],
-                            bitmap2=flux_pred_bitmap,
-                            center1=center1,
-                            center2=center2,
-                            show_diff=True,
-                            device=device
-                        )
+                    # if do_plotting:
+                    #     center1 = enu_point_to_target_plane(
+                    #         enu_point=batch['flux_centers'][sample],
+                    #         target_center = target_area.center,
+                    #         plane_e = target_area.plane_e,
+                    #         plane_u = target_area.plane_u,
+                    #     )
+                    #     center2 = enu_point_to_target_plane(
+                    #         enu_point=center_of_mass,
+                    #         target_center=target_area.center,
+                    #         plane_e=target_area.plane_e,
+                    #         plane_u=target_area.plane_u,
+                    #     )
+                    #     plot_calibration_result(
+                    #         bitmap1=batch['flux_images'][sample],
+                    #         bitmap2=flux_pred_bitmap,
+                    #         center1=center1,
+                    #         center2=center2,
+                    #         show_diff=True,
+                    #         device=device
+                    #     )
 
 
                 else:  # No raytracing, calculate error from heliostat orientation.

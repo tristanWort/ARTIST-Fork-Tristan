@@ -1,10 +1,14 @@
 import torch
 import os
+import sys
 import h5py
 
 from datetime import datetime
 from pathlib import Path
 
+parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if parent_path not in sys.path:
+    sys.path.append(parent_path) 
 from artist.scenario import Scenario
 from calibration_model import CalibrationModel
 
