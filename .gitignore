@@ -165,3 +165,5 @@ AA_new_final_single_device_mode_cpu.png
 AA_new_final_single_device_mode_cuda.png
 AA_new_rank_0_cpu.png
 AA_new_rank_0_cuda.png
+
+master_thesis/HeliOptiCal/tensorboard/
