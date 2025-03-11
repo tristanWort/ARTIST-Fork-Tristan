@@ -4,11 +4,16 @@ import time
 import h5py
 import torch
 
+import sys
+import os
+
+from matplotlib import pyplot as plt
+
+repo_path = os.path.abspath(os.path.dirname('/jump/tw/master_thesis/ARTIST-Fork-Tristan/artist'))  # Get the repo directory
+sys.path.insert(0, repo_path) 
 from artist.raytracing.heliostat_tracing import HeliostatRayTracer
 from artist.util.scenario import Scenario
 from artist.util import paint_loader, set_logger_config, utils
-
-from matplotlib import pyplot as plt
 
 torch.manual_seed(7)
 torch.cuda.manual_seed(7)
@@ -17,10 +22,9 @@ torch.cuda.manual_seed(7)
 set_logger_config()
 
 # Set the device
-#device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
-scenario_path = pathlib.Path(r"C:\Users\wort_tr\Documents\00_Masterarbeit\04_Ergebnisse\01_Scenarios\h5-files")
+scenario_path = pathlib.Path(r"/jump/tw/data/paint/_h5_scenario_files")
 # Specify the path to your scenario.h5 file.
 path_file = scenario_path / r"250306-0952_scenario_AA39-AM35.h5"
 
