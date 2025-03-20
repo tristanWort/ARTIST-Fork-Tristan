@@ -1,0 +1,22 @@
+{
+    "run": {
+        "scenario_path": "/jump/tw/data/paint/_h5_scenario_files/250306-0952_scenario_AA39-AM35.h5",
+        "heliostats": ["AA39", "AM35"],
+        "paint_dir": "/jump/tw/data/paint", 
+        "random_seed": 42,
+        "device": "cpu"
+    },
+    "model": {
+        "init_learning_rate": [0.00001],
+        "parameter_grouping": [],
+        "optimizer_type": "Adam",
+        "scheduler_type": "ReduceLROnPlateau"
+    },
+    "splits": {
+        "path_to_measurements": "/jump/tw/data/paint/metadata/calibration_metadata_selected_heliostats_20250319_113945.csv",
+        "output_dir": "/jump/tw/data/paint/splits/AA39-AM35",
+        "training_sizes": [30],
+        "validation_sizes": [30],
+        "split_types": ["knn"]
+    }
+}

@@ -11,19 +11,21 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 from typing import Union, Literal, List, Tuple
 from pathlib import Path
 
-parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if parent_path not in sys.path:
-    sys.path.append(parent_path) 
+# parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# if parent_path not in sys.path:
+#     sys.path.append(parent_path) 
+
+# Add local artist path for raytracing with multiple parallel heliostats.
+repo_path = os.path.abspath(os.path.dirname('/jump/tw/master_thesis/ARTIST-Fork-Tristan/artist'))
+sys.path.insert(0, repo_path) 
 from artist.scenario import Scenario
 from artist.raytracing import raytracing_utils
 from artist.raytracing.heliostat_tracing import HeliostatRayTracer
 from artist.util import utils
 
 from calibration_dataset import CalibrationDataLoader
-from util import (get_rigid_body_kinematic_parameters_from_scenario,
-                   enu_point_to_target_plane)
-from util import print_gpu_memory_usage
-from utils.plotting_utils import plot_calibration_result
+from util import get_rigid_body_kinematic_parameters_from_scenario
+from image_loss import chamfer_distance_batch
 
 
 log = logging.getLogger(__name__)
@@ -33,80 +35,9 @@ logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] - [%(name)s] - 
 
 random_seed = 7
 
-def chamfer_distance_batch(
-        batch1: torch.Tensor,
-        batch2: torch.Tensor
-) -> torch.Tensor:
-        """
-        Calculate the Chamfer Distance between two image batches.
-
-        Parameters
-        -------
-        batch1 : torch.Tensor
-            First batch of image tensors, i.e. predicted images
-        batch2 : torch.Tensor
-            Second batch of image tensors, i.e. target images
-
-        Returns
-        -------
-        torch.Tensor
-            The Chamfer distance
-        """
-
-        assert batch1.shape == batch2.shape, "Input images must have the same shape."
-        B, H, W = batch1.shape
-
-        # Use soft-thresholding instead of hard binarization
-        threshold = 0.1  # Define a small threshold to keep gradients
-        image1_weights = torch.relu(batch1 - threshold)  # Soft selection
-        image2_weights = torch.relu(batch2 - threshold)
-
-        # Generate coordinate grids for all pixels
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(H, device=batch1.device),
-            torch.arange(W, device=batch1.device),
-            indexing='ij'
-        )
-        coords = torch.stack((grid_y, grid_x), dim=-1).float()  # Shape: (H, W, 2)
-        coords = coords.view(1, H * W, 2).expand(B, -1, -1)  # Shape: (B, H*W, 2)
-
-        # Flatten pixel weights
-        image1_weights = image1_weights.view(B, H * W, 1)
-        image2_weights = image2_weights.view(B, H * W, 1)
-
-        # Softly select active pixel positions
-        image1_coords = coords * image1_weights  # Shape: (B, H*W, 2)
-        image2_coords = coords * image2_weights  # Shape: (B, H*W, 2)
-
-        # Create masks for nonzero pixels
-        image1_mask = image1_weights.squeeze(-1) > 0  # Shape: (B, H*W)
-        image2_mask = image2_weights.squeeze(-1) > 0  # Shape: (B, H*W)
-
-        # Select only nonzero coordinates for each batch element
-        chamfer_distances = []
-        for b in range(B):
-            coords1 = image1_coords[b][image1_mask[b]]  # Shape: (N1, 2)
-            coords2 = image2_coords[b][image2_mask[b]]  # Shape: (N2, 2)
-
-            # If either image is empty, return a large finite value
-            if coords1.numel() == 0 or coords2.numel() == 0:
-                chamfer_distances.append(torch.tensor(1e6, device=batch1.device, dtype=batch1.dtype))
-                continue
-
-            # Compute pairwise Euclidean distances
-            dists_1_to_2 = torch.cdist(coords1, coords2, p=2)  # (N1, N2)
-            dists_2_to_1 = torch.cdist(coords2, coords1, p=2)  # (N2, N1)
-
-            # Compute Chamfer distance: mean of nearest neighbor distances
-            chamfer_dist = (torch.mean(torch.min(dists_1_to_2, dim=1)[0]) +
-                            torch.mean(torch.min(dists_2_to_1, dim=1)[0]))
-
-            chamfer_distances.append(chamfer_dist)
-
-        return torch.stack(chamfer_distances)  # Shape: (B,)
 
 class CalibrationModel(nn.Module):
-    """ #Todo: Complete docstring.
+    """
     A class to represent a Heliostat Calibration Model.
 
     Attributes
@@ -122,49 +53,65 @@ class CalibrationModel(nn.Module):
             self,
             name: str,
             scenario: Scenario,
-            calibration_data_path: Path,
-            calibration_ids: List[str] = None,
-            heliostat_index: int = 0,
+            heliostat_ids: List[str],
+            calib_data_directory: str,
+            config: dict[str, dict],
+            # calibration_ids: List[str] = None,
+            random_seed: int = random_seed,
             device: Union[torch.device, str] = "cuda"
     ) -> None:
         
         super(CalibrationModel, self).__init__()
         log.info(f"Initializing a Heliostat Calibration Model: {name}")
 
+        model_config = config['model']
         self.name = name
         self.scenario = scenario
-        self.heliostat = scenario.heliostats.heliostat_list[heliostat_index]
+        self.heliostat_field = scenario.heliostat_field
         self.target_areas = {area.name: area for area in scenario.target_areas.target_area_list}
 
         self.device = device
 
         # Set up a raytracer. Before that, heliostat needs to be aligned (doesn't matter with which direction).
-        self.heliostat.set_aligned_surface_with_incident_ray_direction(
-            incident_ray_direction = torch.tensor([0.0, -1.0, 0.0, 0.0], device=device),  # south direction
-            device=device)
+        self.heliostat_field.align_surfaces_with_incident_ray_direction(
+            incident_ray_direction = torch.tensor(
+                [0.0, 1.0, 0.0, 0.0], device=device),  # south direction
+            device=device
+            )
+        
+        # TODO: Implement distributed environment, paste world_size and rank here.
         self.raytracer = HeliostatRayTracer(
             scenario=self.scenario,
-            heliostat_index=heliostat_index,
+            world_size=1,
+            rank=0,
+            batch_size=1,
             random_seed=random_seed
-        )
+            )
 
         self.calibration_data_loader = CalibrationDataLoader(
-            data_dir=calibration_data_path,
-            calibration_ids=calibration_ids,
-            power_plant_position=self.scenario.power_plant_position,
-            device=device
-        )
+                    data_directory=calib_data_directory,
+                    heliostats_to_load=heliostat_ids,
+                    power_plant_position=self.scenario.power_plant_position,
+                    load_flux_images=True,
+                    device=device
+                    )
+        self.calibration_data_loader.sun_positions_splits(config=config['splits'])
 
         self.learnable_parameters = (
             get_rigid_body_kinematic_parameters_from_scenario(
-                kinematic=self.heliostat.kinematic
+                kinematic=self.heliostat_field.rigid_body_kinematic
             )
         )
-        log.info(f"Found {len(self.learnable_parameters)} optimizable parameters.")
+        total_parameters = sum(param.numel() for param in self.learnable_parameters.values())
+        log.info(f"Total number of parameters: {total_parameters}")
 
-        self.optimizer, self.scheduler = self.setup_optimizer()
+        self.optimizer, self.scheduler = self.setup_optimizer(optimizer=model_config['optimizer_type'],
+                                                              scheduler=model_config['scheduler_type'],
+                                                              # param_groups=model_config['param_groups'],  #TODO: complete model config
+                                                              initial_lr=model_config['init_learning_rate'],
+                                                              )
 
-        self.writer = SummaryWriter(log_dir='/jump/tw/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/tensorboard/{self.name}')
+        # self.writer = SummaryWriter(log_dir=f'/jump/tw/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/tensorboard/{self.name}')
         # self.writer = summary.create_file_writer('tensorboard/' + self.name)
         self.loss_type = None
 
@@ -185,8 +132,8 @@ class CalibrationModel(nn.Module):
             if optimizer == 'Adam':
                 if param_groups is None:
                     optimizer_kwargs.append({'params': self.learnable_parameters.values(), 'lr': initial_lr})
-                    scheduler_kwargs['base_lr'] = initial_lr / 10
-                    scheduler_kwargs['max_lr'] = initial_lr
+                    scheduler_kwargs['base_lr'] = initial_lr[0] / 10
+                    scheduler_kwargs['max_lr'] = initial_lr[0]
                 else:
                     for i, param_group in enumerate(param_groups):
                         params = [self.learnable_parameters[param] for param in param_group]
@@ -229,142 +176,144 @@ class CalibrationModel(nn.Module):
 
     def forward(
             self,
-            calibration_ids: List[str],
+            heliostats_and_calib_ids: dict[str, List[int]],
             do_raytracing: bool = True,
             do_plotting: bool = False,
             device: Union[torch.device, str] = "cuda"
             ):
         """Generate model output for the next step"""
         device = torch.device(device)
-        self.heliostat.is_aligned = True
+        # self.heliostat_field.is_aligned = True
+        
+        for heliostat_id, calibration_ids in heliostats_and_calib_ids.items():
+            batch = self.calibration_data_loader.get_batch(heliostat_id=heliostat_id, 
+                                                           cal_ids=calibration_ids)
 
-        batch = self.calibration_data_loader.get_batch(calibration_ids)
+            num_samples = len(calibration_ids)
+            reflection_directions_calibration = torch.zeros((num_samples, 4), device=device)
+            reflection_directions = torch.zeros((num_samples, 4), device=device)
+            flux_pred_bitmaps = torch.zeros((num_samples, 256, 256), device=device)
+            # diff_flux_bitmaps = torch.zeros((num_samples, 256, 256), device=device)
 
-        num_samples = len(calibration_ids)
-        reflection_directions_calibration = torch.zeros((num_samples, 4), device=device)
-        reflection_directions = torch.zeros((num_samples, 4), device=device)
-        flux_pred_bitmaps = torch.zeros((num_samples, 256, 256), device=device)
-        # diff_flux_bitmaps = torch.zeros((num_samples, 256, 256), device=device)
+            chds = torch.empty(num_samples, device=device)
+            for sample, calib_id in enumerate(calibration_ids):
+                # print(f"\tRaytrace Sample {sample} of {len(calibration_ids)}")
+                # Use motor positions to get the concentrator orientation.
+                # single_batch = self.calibration_data_loader.get_single_item(calib_id)
+                orientation = self.heliostat.kinematic.motor_positions_to_orientation(
+                    motor_positions=batch['motor_positions'][sample],
+                    device=device
+                )
 
-        chds = torch.empty(num_samples, device=device)
-        for sample, calib_id in enumerate(calibration_ids):
-            # print(f"\tRaytrace Sample {sample} of {len(calibration_ids)}")
-            # Use motor positions to get the concentrator orientation.
-            # single_batch = self.calibration_data_loader.get_single_item(calib_id)
-            orientation = self.heliostat.kinematic.motor_positions_to_orientation(
-                motor_positions=batch['motor_positions'][sample],
-                device=device
+                reflection_directions_calibration[sample] = (batch['flux_centers'][sample] - orientation[:, 3])
+
+                # Translate and rotate surface points and surface normals.
+                aligned_surface_points = self.heliostat.surface_points @ orientation.T
+                aligned_surface_normals = self.heliostat.surface_normals @ orientation.T
+                self.heliostat.current_aligned_surface_points = aligned_surface_points
+                self.heliostat.current_aligned_surface_normals = aligned_surface_normals
+
+
+                # Set up profiler
+                with torch.profiler.profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=True,
+                    profile_memory=True
+                )as prof:
+                
+                    if do_raytracing:
+                        # print_gpu_memory_usage(self.device, f"{__name__}: line 267")
+                        target_area = self.target_areas[batch['receiver_targets'][sample]]
+                        self.raytracer.target_area = target_area
+                        # with torch.no_grad():
+                        flux_pred_bitmap = self.raytracer.trace_rays(
+                            incident_ray_direction=batch['incident_rays'][sample],
+                            device=device
+                        )
+                        # print_gpu_memory_usage(self.device, f"{__name__}: line 275")
+                        flux_pred_bitmap = self.raytracer.normalize_bitmap(flux_pred_bitmap)
+                        # print_gpu_memory_usage(self.device, f"{__name__}: line 277")
+                        # Prediction should match energy content from recorded flux bitmap.
+                        scaling_factor = batch['flux_images'][sample].sum() / flux_pred_bitmap.sum()
+                        flux_pred_bitmap = scaling_factor * flux_pred_bitmap
+
+                        center_of_mass = utils.get_center_of_mass(
+                            bitmap=flux_pred_bitmap,
+                            target_center=target_area.center,
+                            plane_e=target_area.plane_e,
+                            plane_u=target_area.plane_u,
+                            device=device
+                        )
+
+                        reflection_directions[sample] = (center_of_mass - orientation[:, 3])
+                        # Store pixel difference in flux_bitmaps.
+                        flux_pred_bitmaps[sample] = flux_pred_bitmap
+                        # diff_flux_bitmaps[sample] = (flux_pred_bitmap - batch['flux_image'])
+
+                        # print_gpu_memory_usage(self.device, f"{__name__}: line 295")
+                        # chds[sample] = chamfer_distance_batch(flux_pred_bitmap.unsqueeze(0), single_batch['flux_image'].unsqueeze(0)).mean()
+
+                        #TODO: Function does not map the centers properly yet.
+                        # if do_plotting:
+                        #     center1 = enu_point_to_target_plane(
+                        #         enu_point=batch['flux_centers'][sample],
+                        #         target_center = target_area.center,
+                        #         plane_e = target_area.plane_e,
+                        #         plane_u = target_area.plane_u,
+                        #     )
+                        #     center2 = enu_point_to_target_plane(
+                        #         enu_point=center_of_mass,
+                        #         target_center=target_area.center,
+                        #         plane_e=target_area.plane_e,
+                        #         plane_u=target_area.plane_u,
+                        #     )
+                        #     plot_calibration_result(
+                        #         bitmap1=batch['flux_images'][sample],
+                        #         bitmap2=flux_pred_bitmap,
+                        #         center1=center1,
+                        #         center2=center2,
+                        #         show_diff=True,
+                        #         device=device
+                        #     )
+
+
+                    else:  # No raytracing, calculate error from heliostat orientation.
+                        reflection_directions[sample] = raytracing_utils.reflect(
+                            -batch['incident_rays'][sample], orientation[:,2]
+                        )
+                    
+                # print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=40)) 
+
+            # Calculate the error between both reflection directions.
+            alignment_errors = self.calculate_angles_mrad(
+                reflection_directions_calibration, reflection_directions
             )
 
-            reflection_directions_calibration[sample] = (batch['flux_centers'][sample] - orientation[:, 3])
-
-            # Translate and rotate surface points and surface normals.
-            aligned_surface_points = self.heliostat.surface_points @ orientation.T
-            aligned_surface_normals = self.heliostat.surface_normals @ orientation.T
-            self.heliostat.current_aligned_surface_points = aligned_surface_points
-            self.heliostat.current_aligned_surface_normals = aligned_surface_normals
-
-
-            # Set up profiler
-            with torch.profiler.profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=True
-            )as prof:
-            
-                if do_raytracing:
-                    # print_gpu_memory_usage(self.device, f"{__name__}: line 267")
-                    target_area = self.target_areas[batch['receiver_targets'][sample]]
-                    self.raytracer.target_area = target_area
-                    # with torch.no_grad():
-                    flux_pred_bitmap = self.raytracer.trace_rays(
-                        incident_ray_direction=batch['incident_rays'][sample],
-                        device=device
-                    )
-                    # print_gpu_memory_usage(self.device, f"{__name__}: line 275")
-                    flux_pred_bitmap = self.raytracer.normalize_bitmap(flux_pred_bitmap)
-                    # print_gpu_memory_usage(self.device, f"{__name__}: line 277")
-                    # Prediction should match energy content from recorded flux bitmap.
-                    scaling_factor = batch['flux_images'][sample].sum() / flux_pred_bitmap.sum()
-                    flux_pred_bitmap = scaling_factor * flux_pred_bitmap
-
-                    center_of_mass = utils.get_center_of_mass(
-                        bitmap=flux_pred_bitmap,
-                        target_center=target_area.center,
-                        plane_e=target_area.plane_e,
-                        plane_u=target_area.plane_u,
-                        device=device
-                    )
-
-                    reflection_directions[sample] = (center_of_mass - orientation[:, 3])
-                    # Store pixel difference in flux_bitmaps.
-                    flux_pred_bitmaps[sample] = flux_pred_bitmap
-                    # diff_flux_bitmaps[sample] = (flux_pred_bitmap - batch['flux_image'])
-
-                    # print_gpu_memory_usage(self.device, f"{__name__}: line 295")
-                    # chds[sample] = chamfer_distance_batch(flux_pred_bitmap.unsqueeze(0), single_batch['flux_image'].unsqueeze(0)).mean()
-
-                    #Todo: Function does not map the centers properly yet.
-                    # if do_plotting:
-                    #     center1 = enu_point_to_target_plane(
-                    #         enu_point=batch['flux_centers'][sample],
-                    #         target_center = target_area.center,
-                    #         plane_e = target_area.plane_e,
-                    #         plane_u = target_area.plane_u,
-                    #     )
-                    #     center2 = enu_point_to_target_plane(
-                    #         enu_point=center_of_mass,
-                    #         target_center=target_area.center,
-                    #         plane_e=target_area.plane_e,
-                    #         plane_u=target_area.plane_u,
-                    #     )
-                    #     plot_calibration_result(
-                    #         bitmap1=batch['flux_images'][sample],
-                    #         bitmap2=flux_pred_bitmap,
-                    #         center1=center1,
-                    #         center2=center2,
-                    #         show_diff=True,
-                    #         device=device
-                    #     )
-
-
-                else:  # No raytracing, calculate error from heliostat orientation.
-                    reflection_directions[sample] = raytracing_utils.reflect(
-                        -batch['incident_rays'][sample], orientation[:,2]
-                    )
+            if do_raytracing:
+                mse = torch.nn.MSELoss()
+                msae = mse(alignment_errors, torch.zeros_like(alignment_errors))
                 
-            # print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=40)) 
+                diff_flux_bitmaps = flux_pred_bitmaps - batch['flux_images']
+                mape = diff_flux_bitmaps.abs().mean()
+                
+                # chamfer_loss = chamfer_distance(flux_bitmap_pred[0], flux_bitmaps[0])
+                ssim_fnc = StructuralSimilarityIndexMeasure().to(device)
+                ssim = ssim_fnc(flux_pred_bitmaps.unsqueeze(1).to(device), batch['flux_images'].unsqueeze(1).to(device))
+                
+                # loss_type = '(1 - Structural Similarity Index)'
+                chamfer_distances = chamfer_distance_batch(flux_pred_bitmaps, batch['flux_images'])
+                chd = chamfer_distances.mean()
+                
+                print(f"\tMSAE: {msae.item()}")
+                print(f"\tMAPE: {mape.item()}")
+                print(f"\tSSIM: {ssim.item()}")
+                print(f"\tCHD: {chd.item()}")
+                loss = msae
 
-        # Calculate the error between both reflection directions.
-        alignment_errors = self.calculate_angles_mrad(
-            reflection_directions_calibration, reflection_directions
-        )
-
-        if do_raytracing:
-            mse = torch.nn.MSELoss()
-            msae = mse(alignment_errors, torch.zeros_like(alignment_errors))
-            
-            diff_flux_bitmaps = flux_pred_bitmaps - batch['flux_images']
-            mape = diff_flux_bitmaps.abs().mean()
-            
-            # chamfer_loss = chamfer_distance(flux_bitmap_pred[0], flux_bitmaps[0])
-            ssim_fnc = StructuralSimilarityIndexMeasure().to(device)
-            ssim = ssim_fnc(flux_pred_bitmaps.unsqueeze(1).to(device), batch['flux_images'].unsqueeze(1).to(device))
-            
-            # loss_type = '(1 - Structural Similarity Index)'
-            chamfer_distances = chamfer_distance_batch(flux_pred_bitmaps, batch['flux_images'])
-            chd = chamfer_distances.mean()
-            
-            print(f"\tMSAE: {msae.item()}")
-            print(f"\tMAPE: {mape.item()}")
-            print(f"\tSSIM: {ssim.item()}")
-            print(f"\tCHD: {chd.item()}")
-            loss = msae
-
-        else:
-            mse = torch.nn.MSELoss()
-            loss = mse(alignment_errors, torch.zeros_like(alignment_errors))
-            loss_type = 'MSE (Alignment Errors)'
+            else:
+                mse = torch.nn.MSELoss()
+                loss = mse(alignment_errors, torch.zeros_like(alignment_errors))
+                loss_type = 'MSE (Alignment Errors)'
 
         return alignment_errors, loss
 
@@ -389,29 +338,20 @@ class CalibrationModel(nn.Module):
 
     def calibrate(
             self,
+            split_type: str,
+            split_sizes: Tuple[int, int],
             num_epochs: int = 30,
             log_steps: int = 10,
             tolerance: float = 0.0,
-            train_valid_test_sizes: Tuple[int, int, int] = (30, 15, 15),
             seed: int = random_seed,
             exclude_params: List[str] = (),
             with_raytracing: bool = True,
+            run_config: dict = None,
             device: Union[torch.device, str] = "cuda"
     ):
-        if sum(train_valid_test_sizes) > len(self.calibration_data_loader):
-            raise ValueError(f"Sum of split sizes {train_valid_test_sizes} exceeds \
-                             number of available samples {len(self.calibration_data_loader)}.")
 
-        train_ids, valid_ids, test_ids = self.calibration_data_loader.split_data(
-            train_valid_test_sizes=train_valid_test_sizes, 
-            split_type='random', 
-            seed=seed
-            )
+        split_df = self.calibration_data_loader.splits[split_type][split_sizes]
         
-        intersection_1 = set(train_ids).intersection(set(valid_ids))
-        intersection_2 = set(train_ids).intersection(set(test_ids))
-        print(intersection_1, intersection_2)
-
         for param in exclude_params:
             try:
                 self.learnable_parameters[param].requires_grad = False
@@ -425,8 +365,14 @@ class CalibrationModel(nn.Module):
             self.train()
             self.optimizer.zero_grad()
 
+            train_df = split_df[split_df['Split'] == 'train']
+            train_dict = {
+                heliostat_id: train_df.loc[train_df['HeliostatId'] == heliostat_id].index.tolist()
+                for heliostat_id in split_df.loc[split_df['Split'] == 'train', 'HeliostatId'].unique()
+            }
+            
             train_alignment_errors, train_loss = self.forward(
-                calibration_ids=train_ids,
+                heliostats_and_calib_ids=train_dict,
                 do_raytracing=with_raytracing,
                 do_plotting=False,
                 device=device
@@ -441,7 +387,7 @@ class CalibrationModel(nn.Module):
             self.eval()
             with torch.no_grad():
                 valid_alignment_errors, valid_loss = self.forward(
-                    calibration_ids=valid_ids,
+                    calibration_ids=split_df[split_df['Split'] == 'train'].index.tolist(),
                     do_raytracing=with_raytracing,
                     do_plotting=False,
                     device=device
@@ -467,7 +413,7 @@ class CalibrationModel(nn.Module):
                     print(f"Parameter {name} is NaN.")
                 self.writer.add_histogram(name, param.cpu().detach().numpy(), epoch)
 
-            # ToDo: Log Raytracer Flux Bitmaps to Tensorboard.
+            # TODO: Log Raytracer Flux Bitmaps to Tensorboard.
             # summary.image("FluxBitmaps/id", flux_bitmap, epoch)
 
             avg_train_error = train_alignment_errors.mean()
@@ -509,7 +455,7 @@ class CalibrationModel(nn.Module):
             log.info(f"Test Loss: {test_loss.item():.4f}, "
                      f"Avg Test Error (mrad): {avg_test_error.item():.2f}")
 
-    # Todo: Include Learning Rate finder.
+    # TODO: Include Learning Rate finder.
     # def find_lr(
     #         self,
     #         start_lr: float = 1e-8,

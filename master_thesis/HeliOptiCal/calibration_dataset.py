@@ -5,14 +5,21 @@ import torch
 import torchvision.transforms as transforms
 import pathlib
 import random
+import pandas as pd
+import numpy as np
 
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from typing import Union, Dict, List, Tuple, Optional, Any, Literal
 from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 from artist.util.paint_loader import  extract_paint_calibration_data
+import paint.util.paint_mappings as mappings
+from paint.data.dataset_splits import DatasetSplitter
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
@@ -34,12 +41,13 @@ class CalibrationDataLoader:
     The data can be loaded from a directory containing JSON and JPG files,
     and can be retrieved by specifying calibration IDs.
     """
-
+    
+    #TODO: Make CalibrationDataLoader a subclass of Dataset and implement __getitem__ and __len__ methods.
     def __init__(
             self,
-            data_dir: Union[str, pathlib.Path],
+            data_directory: Union[str, Path],
+            heliostats_to_load: List[str],
             power_plant_position: torch.Tensor,
-            calibration_ids: Optional[List[str]] = [],
             load_flux_images: bool = True,
             properties_file_ends_with: Optional[str] = '-calibration-properties.json',
             flux_file_ends_with: Optional[str] = '-flux.png',
@@ -49,11 +57,16 @@ class CalibrationDataLoader:
         Initialize the CalibrationDataLoader with a data directory.
 
         Args:
-            data_dir (str, pathlib.Path): Path to the directory containing calibration data files
-            calibration_ids (List[str]): List of calibration IDs to load (default: None, which loads all IDs
-            in the directory)
+            data_directory (str, Path): Path to the directory containing calibration data files with 'heliostat_id' as folders.
+            heliostats_to_load (List[str]): List of heliostat IDs to load calibration data for.
+            power_plant_position (torch.Tensor): The position of the power plant in the world coordinate system.
+            load_flux_images (bool): Whether to load flux images from PNG files (default: True)
+            properties_file_ends_with (str): File ending for calibration properties JSON files (default: '-calibration-properties.json')
+            flux_file_ends_with (str): File ending for flux images PNG files (default: '-flux.png')
+            device (torch.device, str): Device to load data tensors onto (default: 'cuda')
         """
-        self.data_dir = data_dir
+        self.data_dir = data_directory
+        self.heliostats_to_load = heliostats_to_load
         self.power_plant_position = power_plant_position
 
         # Storage dictionaries for each data type
@@ -65,9 +78,6 @@ class CalibrationDataLoader:
         self.receiver_targets: Dict[str, str] = {}
         self.flux_images: Dict[str, torch.Tensor] = {}  # shape [256, 256]
 
-        # List of all calibration IDs
-        self.calibration_ids: List[str] = calibration_ids
-
         self.load_flux_images = load_flux_images
 
         # File endings for calibration properties and flux images
@@ -76,8 +86,10 @@ class CalibrationDataLoader:
 
         self.device = device
 
-        # Load the data (you'll implement your custom loading logic here)
+        # Load the data
         self._load_data()
+        
+        self.splits = {}
 
     def _load_data(self):
         """
@@ -85,63 +97,61 @@ class CalibrationDataLoader:
 
         This method should be customized to implement your specific data loading logic.
         """
-
-        #Todo: Ask Claude if this is good code.
-        if not os.path.exists(self.data_dir):
-            raise FileNotFoundError(f"Calibration folder not found at path: {self.data_dir}")
-
-        log.info(f"Loading calibration data from: {self.data_dir}") 
-        if self.calibration_ids is None:  # load all calibration json files in the folder.
-            properties_files = [os.path.join(self.data_dir, f)
-                                for f in os.listdir(self.data_dir)
+        calibration_directories = {}
+        for heliostat_id in self.heliostats_to_load: 
+            calibration_directory = (Path(self.data_dir) /
+                                    f'{heliostat_id}/Calibration')
+            if not os.path.exists(calibration_directory):
+                raise FileNotFoundError(f"Calibration folder not found at path: "
+                                        f"{calibration_directory}")
+            else:
+                calibration_directories[heliostat_id] = calibration_directory
+        
+        self.calibration_ids = {heliostat_id: [] for heliostat_id in self.heliostats_to_load}
+        # Load all calibration json files for each heliostat.        
+        for heliostat_id, calibration_directory in calibration_directories.items():
+            log.info(f"Loading data for Heliostat {heliostat_id} from: {calibration_directory}")  
+            properties_files = [os.path.join(calibration_directory, f)
+                                for f in os.listdir(calibration_directory) 
                                 if f.endswith(self.properties_file_ends_with)]
-        else:  # only load the calibration json files which were specified.
-            properties_files = []
-            for calibration_id in self.calibration_ids:
-                try:
-                    properties_files.append(os.path.join(self.data_dir,
-                                                         calibration_id +
-                                                         self.properties_file_ends_with))
-                except FileNotFoundError:
-                    log.warning(f"Calibration json file not found at: "
-                                f"{calibration_id + self.properties_file_ends_with}.")
 
-        self.calibration_ids = []
-        for properties_file in properties_files:
-            calibration_id = ''.join(filter(str.isdigit, Path(properties_file).name))
-            self.calibration_ids.append(calibration_id)
+            
+            # TODO: Change so that only data paths are stored and not the data itself.
+            for properties_file in properties_files:
+                calibration_id = int(''.join(filter(str.isdigit, Path(properties_file).name)))
+                self.calibration_ids[heliostat_id].append(calibration_id)
 
-            with open(properties_file, 'r') as file:
-                calibration_data = json.load(file)
-            self.sun_azimuths[calibration_id] = calibration_data['sun_azimuth']
-            self.sun_elevations[calibration_id] = calibration_data['sun_elevation']
+                with open(properties_file, 'r') as file:
+                    calibration_data = json.load(file)
+                self.sun_azimuths[calibration_id] = calibration_data['sun_azimuth']
+                self.sun_elevations[calibration_id] = calibration_data['sun_elevation']
 
-            (
-                calibration_target_name,
-                spot_centers,
-                incident_ray_direction,
-                motor_positions,
-            ) = extract_paint_calibration_data(
-                calibration_properties_path=Path(properties_file),
-                power_plant_position=self.power_plant_position,
-                device=self.device
-            )
-            self.flux_centers[calibration_id] = spot_centers.to(self.device)
-            self.motor_positions[calibration_id] = motor_positions.to(self.device)
-            self.incident_rays[calibration_id] = incident_ray_direction.to(self.device)
-            self.receiver_targets[calibration_id] = calibration_target_name
+                (
+                    calibration_target_name,
+                    spot_centers,
+                    incident_ray_direction,
+                    motor_positions,
+                ) = extract_paint_calibration_data(
+                    calibration_properties_path=Path(properties_file),
+                    power_plant_position=self.power_plant_position,
+                    device=self.device
+                )
+                self.flux_centers[calibration_id] = spot_centers.to(self.device)
+                self.motor_positions[calibration_id] = motor_positions.to(self.device)
+                self.incident_rays[calibration_id] = incident_ray_direction.to(self.device)
+                self.receiver_targets[calibration_id] = calibration_target_name
 
-            if self.load_flux_images:
-                flux_file = properties_file.replace(self.properties_file_ends_with,
-                                                    self.flux_file_ends_with)
-                if os.path.exists(flux_file):
-                    flux_img = Image.open(flux_file)
-                    flux_img = (transforms.ToTensor()(flux_img)).squeeze(0)
-                    self.flux_images[calibration_id] = flux_img.to(self.device)
-                else:
-                    raise FileNotFoundError(f"No flux image found for at: "
-                                            f"{calibration_id + self.flux_file_ends_with}.")
-        log.info(f"Calibration data loaded for {len(self.flux_centers)} calibration IDs.")
+                if self.load_flux_images:
+                    flux_file = properties_file.replace(self.properties_file_ends_with,
+                                                        self.flux_file_ends_with)
+                    if os.path.exists(flux_file):
+                        flux_img = Image.open(flux_file)
+                        flux_img = (transforms.ToTensor()(flux_img)).squeeze(0)
+                        self.flux_images[calibration_id] = flux_img.to(self.device)
+                    else:
+                        raise FileNotFoundError(f"No flux image found for at: "
+                                                f"{calibration_id + self.flux_file_ends_with}.")
+            log.info(f"Loaded data for {len(self.calibration_ids[heliostat_id])} calibration IDs.")
 
     def get_calibration_ids(self) -> List[str]:
         """
@@ -152,7 +162,7 @@ class CalibrationDataLoader:
         """
         return self.calibration_ids.copy()
 
-    def get_batch(self, cal_ids: List[str]) -> Dict[str, Union[torch.Tensor, List[str]]]:
+    def get_batch(self, heliostat_id: str, cal_ids: List[int]) -> Dict[str, Union[torch.Tensor, List[str]]]:
         """
         Get a batch of calibration data for the specified calibration IDs.
 
@@ -172,7 +182,7 @@ class CalibrationDataLoader:
             KeyError: If any of the requested calibration IDs are not available
         """
         # Check if all requested IDs are available
-        missing_ids = set(cal_ids) - set(self.calibration_ids)
+        missing_ids = set(cal_ids) - set(self.calibration_ids[heliostat_id])
         if missing_ids:
             raise KeyError(f"Calibration IDs not found in CalibrationDataLoader: {missing_ids}")
 
@@ -269,6 +279,185 @@ class CalibrationDataLoader:
 
         return self.get_batch(selected_ids)
 
+    def sun_positions_splits(
+        self,
+        config: Dict[str, Any],  # dictionary containing configuration for splits
+    ):
+        # Create a DatasetSplitter instance.
+        # Use remove_unused_data=False to preserve extra columns (e.g. azimuth, elevation) needed for plotting.
+        calibration_metadata_file = Path(config['path_to_measurements'])
+        if not calibration_metadata_file.exists():
+            raise FileNotFoundError(
+                f"Calibration metadata file '{calibration_metadata_file}' not found."
+            )
+
+        output_dir = Path(config['output_dir'])
+        
+        splitter = DatasetSplitter(
+            input_file=calibration_metadata_file,
+            output_dir=output_dir,
+            remove_unused_data=False,
+        )
+
+        # Read the full calibration metadata once.
+        calibration_data = pd.read_csv(calibration_metadata_file)
+
+        # Ensure that the plot_output directory exists.
+        plot_output_path = Path(config['output_dir']) / "plots"
+        plot_output_path.mkdir(parents=True, exist_ok=True)
+
+        # For each split type, create a separate plot file.
+        splits = {split_type: {} for split_type in config['split_types']}
+        
+        for split_type in config['split_types']:
+            # For the current split type, gather the split data for each combination of training and validation sizes.
+            # We use a dictionary keyed by (training_size, validation_size)
+            current_split_data = {}
+            for training_size in config['training_sizes']:
+                for validation_size in config['validation_sizes']:
+                    split_df = splitter.get_dataset_splits(
+                        split_type=split_type,
+                        training_size=training_size,
+                        validation_size=validation_size,
+                    )
+                    
+                    splits[split_type].update({(training_size, validation_size): split_df})
+                    # split_df['SplitType'] = split_type
+                    # split_df['Split'] = split_df['Split']
+                    # split_df['Training'] = training_size
+                    # split_df['Validation'] = validation_size
+                    current_split_data[(training_size, validation_size)] = split_df
+                    # splits_df = pd.concat([splits_df, split_df], ignore_index=True)
+                
+                # Append the IDs to the corresponding lists in the splits dictionary.
+                # splits[split_type]['train'] = split_df[split_df['Split'] == 'train'].index.tolist()
+                # splits[split_type]['validation'] = split_df[split_df['Split'] == 'validation'].index.tolist()
+                # splits[split_type]['test'] = split_df[split_df['Split'] == 'test'].index.tolist()
+
+            # Determine grid dimensions for subplots.
+            # Here we use rows = number of validation sizes and columns = number of training sizes.
+            ncols = len(config['training_sizes'])
+            nrows = len(config['validation_sizes'])
+            num_plots = ncols * nrows
+
+            fig, axes = plt.subplots(
+                nrows=nrows, ncols=ncols, figsize=(6 * ncols, 5 * nrows), sharey=True
+            )
+
+            # Flatten axes so that we can iterate uniformly.
+            if num_plots == 1:
+                axes = [axes]
+            else:
+                axes = np.array(axes).flatten()
+
+            # For each combination, create a subplot.
+            for ax, ((training_size, validation_size), split_df) in zip(
+                axes, current_split_data.items()
+            ):
+                # Merge the split info into the full calibration data.
+                split_df_reset = (
+                    split_df.reset_index()
+                )  # bring the ID (index) back as a column
+                merged_data = pd.merge(
+                    calibration_data,
+                    split_df_reset[[mappings.ID_INDEX, mappings.SPLIT_KEY]],
+                    on=mappings.ID_INDEX,
+                    how="left",
+                )
+
+                # Group by heliostat and split to count occurrences.
+                split_counts = (
+                    merged_data.groupby([mappings.HELIOSTAT_ID, mappings.SPLIT_KEY])
+                    .size()
+                    .unstack(fill_value=0)
+                )
+                # Add total counts for sorting and then drop the helper column.
+                split_counts[mappings.TOTAL_INDEX] = split_counts.sum(axis=1)
+                split_counts = split_counts.sort_values(
+                    by=mappings.TOTAL_INDEX, ascending=False
+                ).drop(columns=[mappings.TOTAL_INDEX])
+                # Reorder columns: train, then test, then validation.
+                split_counts = split_counts.reindex(
+                    columns=[
+                        mappings.TRAIN_INDEX,
+                        mappings.TEST_INDEX,
+                        mappings.VALIDATION_INDEX,
+                    ],
+                    fill_value=0,
+                )
+
+                # Replace the heliostat IDs with sequential numbers (for plotting purposes).
+                num_heliostats = len(split_counts)
+                split_counts.index = range(num_heliostats)
+
+                # Determine the bar colors using the shared mapping.
+                colors = mappings.TRAIN_TEST_VAL_COLORS
+                bar_colors = [colors.get(split, "gray") for split in split_counts.columns]
+
+                # Plot the stacked bar plot.
+                split_counts.plot(
+                    kind="bar", stacked=True, ax=ax, legend=False, color=bar_colors
+                )
+                # Change the x-axis label as requested.
+                ax.set_xlabel("Heliostats sorted by # measurements", fontsize=10)
+                ax.set_ylabel("Count", fontsize=10)
+                ax.tick_params(axis="x", rotation=45)
+                ticks = list(range(0, num_heliostats, 200))
+                ax.set_xticks(ticks)
+
+                # Set y-axis limits for KNN and KMEANS split types.
+                if split_type in [mappings.KMEANS_SPLIT, mappings.KNN_SPLIT]:
+                    ax.set_ylim(0, 500)
+
+                # Set subplot title indicating the training and validation sizes.
+                ax.set_title(f"Train {training_size} / Val {validation_size}", fontsize=12)
+
+                heliostat_ids = merged_data[mappings.HELIOSTAT_ID].unique()
+                # ---- Add an inset for the example heliostat ----
+                example_heliostat_df = merged_data[
+                    merged_data[mappings.HELIOSTAT_ID] == heliostat_ids[0]
+                ]
+                inset_ax = inset_axes(
+                    ax,
+                    width="50%",
+                    height="50%",
+                    loc="upper right",
+                    bbox_to_anchor=(0, -0.05, 1, 1),
+                    bbox_transform=ax.transAxes,
+                )
+                for split, color in colors.items():
+                    subset = example_heliostat_df[
+                        example_heliostat_df[mappings.SPLIT_KEY] == split
+                    ]
+                    if not subset.empty:
+                        inset_ax.scatter(
+                            subset[mappings.AZIMUTH],
+                            subset[mappings.ELEVATION],
+                            color=color,
+                            alpha=0.5,
+                        )
+                inset_ax.set_title(f"Heliostat {heliostat_ids[0]}", fontsize=8, pad=-5)
+                inset_ax.set_xlabel("Azimuth", fontsize=8)
+                inset_ax.set_ylabel("Elevation", fontsize=8)
+                inset_ax.tick_params(axis="both", labelsize=8)
+
+            # Create a common legend (placed in the upper left of the first subplot).
+            legend_handles = [
+                mpatches.Patch(color=colors[split], label=split.capitalize())
+                for split in colors
+            ]
+            axes[0].legend(handles=legend_handles, loc="upper left", fontsize=10)
+
+            plt.tight_layout()
+            # Save the figure as "02_<split_type>_split.pdf"
+            file_name = plot_output_path / f"02_{split_type}_split.pdf"
+            plt.savefig(file_name, dpi=300)
+            plt.close(fig)
+            print(f"Saved plot for split type '{split_type}' to {file_name}")
+        
+        self.splits = splits  #TODO: Load the splits from dataframe or csv file.
+
+    """Old split function. Use sun_positions_splits which was taken form paint."""
     def split_data(
         self,
         train_valid_test_sizes: Tuple[int,int,int] = (30, 15, 15),
@@ -349,8 +538,8 @@ class CalibrationDataLoader:
             self.plot_splits_sun_positions(train_ids, valid_ids, test_ids)
             return train_ids, valid_ids, test_ids
     
+    # TODO: Change plot function (Right now plotting for paint splits is dont in sun_positions_splits)
     def plot_splits_sun_positions(self, train_ids: List[str], valid_ids: List[str], test_ids: List[str]) -> None:
-        import matplotlib.pyplot as plt
         c_map = ['black', 'blue', 'red']
         labels = ['Training', 'Validation', 'Testing']
         for i, split in enumerate([train_ids, valid_ids, test_ids]):
@@ -370,6 +559,7 @@ class CalibrationDataLoader:
         plt.close()
 
     def __len__(self) -> int:
+        #TODO: Change, ids is a dictionary.
         """
         Get the number of calibration points.
 

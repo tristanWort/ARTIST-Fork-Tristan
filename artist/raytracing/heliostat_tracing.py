@@ -294,7 +294,7 @@ class HeliostatRayTracer:
         self.distortions_dataset = DistortionsDataset(
             light_source=scenario.light_sources.light_source_list[0],
             number_of_points_per_heliostat=self.number_of_surface_points_per_heliostat,
-            number_of_heliostats=self.scenario.heliostat_field.all_current_aligned_surface_points.shape[0],
+            number_of_heliostats=1,  # distortians need to be loaded for each helisotat separately
             random_seed=random_seed,
         )
         # Create restricted distributed sampler.
@@ -340,56 +340,57 @@ class HeliostatRayTracer:
         """
         device = torch.device(device)
 
-        final_bitmap = torch.zeros(
-            (self.bitmap_resolution_u, self.bitmap_resolution_e), device=device
+        final_bitmaps = torch.zeros(
+            (self.batch_size, self.bitmap_resolution_u, self.bitmap_resolution_e), device=device
         )
 
         if not torch.all(self.scenario.heliostat_field.all_aligned_heliostats == 1):
             raise ValueError("Not all heliostats have been aligned.")
-        self.scenario.heliostat_field.all_preferred_reflection_directions = raytracing_utils.reflect_all(incoming_ray_direction=incident_ray_direction,
-                                                                                         reflection_surface_normals=self.scenario.heliostat_field.all_current_aligned_surface_normals)
+        self.scenario.heliostat_field.all_preferred_reflection_directions = raytracing_utils.reflect_all(
+            incoming_ray_direction=incident_ray_direction,
+            reflection_surface_normals=self.scenario.heliostat_field.all_current_aligned_surface_normals
+            )
 
-
-        for batch_index, (batch_u, batch_e) in enumerate(self.distortions_loader):
-
-            sampler_indices = list(self.distortions_sampler)
+        # TODO: using one batch for each heliostat is a bit of a hack, but it works for now
+        for _, (batch_u, batch_e) in enumerate(self.distortions_loader):
             
-            heliostat_indices = sampler_indices[batch_index * self.batch_size : (batch_index + 1) * self.batch_size]
-        
-            rays = self.scatter_rays(batch_u, batch_e, heliostat_indices, device)
-            #torch.cuda.empty_cache()
+            for batch_index in range(self.batch_size):  # only batch one heliostat         
+            
+                heliostat_indices = [batch_index]
+                
+                rays = self.scatter_rays(batch_u, batch_e, heliostat_indices, device)
 
-            intersections, absolute_intensities = raytracing_utils.line_plane_intersections(
-                rays=rays,
-                plane_normal_vector=target_area.normal_vector,
-                plane_center=target_area.center,
-                points_at_ray_origin=self.scenario.heliostat_field.all_current_aligned_surface_points[heliostat_indices],
-            )
-            #torch.cuda.empty_cache()
+                intersections, absolute_intensities = raytracing_utils.line_plane_intersections(
+                    rays=rays,
+                    plane_normal_vector=target_area.normal_vector,
+                    plane_center=target_area.center,
+                    points_at_ray_origin=self.scenario.heliostat_field.all_current_aligned_surface_points[heliostat_indices],
+                )
+                #torch.cuda.empty_cache()
 
-            dx_intersections = (
-                intersections[:, :, :, 0]
-                + target_area.plane_e / 2
-                - target_area.center[0]
-            )
-            dy_intersections = (
-                intersections[:, :, :, 2]
-                + target_area.plane_u / 2
-                - target_area.center[2]
-            )
+                dx_intersections = (
+                    intersections[:, :, :, 0]
+                    + target_area.plane_e / 2
+                    - target_area.center[0]
+                )
+                dy_intersections = (
+                    intersections[:, :, :, 2]
+                    + target_area.plane_u / 2
+                    - target_area.center[2]
+                )
 
-            intersection_indices = (
-                (-1 <= dx_intersections)
-                & (dx_intersections < target_area.plane_e + 1)
-                & (-1 <= dy_intersections)
-                & (dy_intersections < target_area.plane_u + 1)
-            )
+                intersection_indices = (
+                    (-1 <= dx_intersections)
+                    & (dx_intersections < target_area.plane_e + 1)
+                    & (-1 <= dy_intersections)
+                    & (dy_intersections < target_area.plane_u + 1)
+                )
 
-            total_bitmap = self.sample_bitmap(target_area, dx_intersections, dy_intersections, intersection_indices, absolute_intensities, device=device)
+                total_bitmap = self.sample_bitmap(target_area, dx_intersections, dy_intersections, intersection_indices, absolute_intensities, device=device)
 
-            final_bitmap = final_bitmap + total_bitmap
+                final_bitmaps[batch_index] = total_bitmap
 
-        return final_bitmap
+        return final_bitmaps
 
     def scatter_rays(
         self,

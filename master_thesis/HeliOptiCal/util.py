@@ -3,6 +3,7 @@ import gpustat
 import psutil
 from artist.field.kinematic_rigid_body import RigidBody
 
+# TODO: Add names keys for parameters dict
 def get_rigid_body_kinematic_parameters_from_scenario(
     kinematic: RigidBody,
 ) -> dict[str, torch.Tensor]:
@@ -21,36 +22,70 @@ def get_rigid_body_kinematic_parameters_from_scenario(
     """
 
     parameters_dict = {
-        "heliostat_position_enu_4d": kinematic.position,
-        "first_joint_translation_e": kinematic.deviation_parameters.first_joint_translation_e,
-        "first_joint_translation_n": kinematic.deviation_parameters.first_joint_translation_n,
-        "first_joint_translation_u": kinematic.deviation_parameters.first_joint_translation_u,
-        "first_joint_tilt_e": kinematic.deviation_parameters.first_joint_tilt_e,
-        "first_joint_tilt_n": kinematic.deviation_parameters.first_joint_tilt_n,
-        "first_joint_tilt_u": kinematic.deviation_parameters.first_joint_tilt_u,
-        "second_joint_translation_e": kinematic.deviation_parameters.second_joint_translation_e,
-        "second_joint_translation_n": kinematic.deviation_parameters.second_joint_translation_n,
-        "second_joint_translation_u": kinematic.deviation_parameters.second_joint_translation_u,
-        "second_joint_tilt_e": kinematic.deviation_parameters.second_joint_tilt_e,
-        "second_joint_tilt_n": kinematic.deviation_parameters.second_joint_tilt_n,
-        "second_joint_tilt_u": kinematic.deviation_parameters.second_joint_tilt_u,
-        "concentrator_translation_e": kinematic.deviation_parameters.concentrator_translation_e,
-        "concentrator_translation_n": kinematic.deviation_parameters.concentrator_translation_n,
-        "concentrator_translation_u": kinematic.deviation_parameters.concentrator_translation_u,
-        "concentrator_tilt_e": kinematic.deviation_parameters.concentrator_tilt_e,
-        "concentrator_tilt_n": kinematic.deviation_parameters.concentrator_tilt_n,
-        "concentrator_tilt_u": kinematic.deviation_parameters.concentrator_tilt_u,
-        "actuator1_increment": kinematic.actuators.actuator_list[0].increment,
-        "actuator1_initial_stroke_length": kinematic.actuators.actuator_list[0].initial_stroke_length,
-        "actuator1_offset": kinematic.actuators.actuator_list[0].offset,
-        "actuator1_pivot_radius": kinematic.actuators.actuator_list[0].pivot_radius,
-        "actuator1_initial_angle": kinematic.actuators.actuator_list[0].initial_angle,
-        "actuator2_increment": kinematic.actuators.actuator_list[1].increment,
-        "actuator2_initial_stroke_length": kinematic.actuators.actuator_list[1].initial_stroke_length,
-        "actuator2_offset": kinematic.actuators.actuator_list[1].offset,
-        "actuator2_pivot_radius": kinematic.actuators.actuator_list[1].pivot_radius,
-        "actuator2_initial_angle": kinematic.actuators.actuator_list[1].initial_angle,
+        "all_heliostat_positions_enu_4d": kinematic.heliostat_positions,
+        "all_kinematic_deviation_parameters": kinematic.deviation_parameters,
+        "actuators_clockwise_axis_movements": kinematic.actuators.clockwise_axis_movements,
+        "actuators_increments": kinematic.actuators.increments,
+        "actuators_initial_stroke_lengths": kinematic.actuators.initial_stroke_lengths,
+        "actuators_offsets": kinematic.actuators.offsets,
+        "actuators_pivot_radii": kinematic.actuators.pivot_radii,
+        "actuators_initial_angles": kinematic.actuators.initial_angles,
     }
+
+    for parameter in parameters_dict.values():
+        if parameter is not None:
+            parameter.requires_grad_()
+
+    return parameters_dict
+
+# def get_rigid_body_kinematic_parameters_from_scenario(
+#     kinematic: RigidBody,
+# ) -> dict[str, torch.Tensor]:
+#     """
+#     Extract all deviation parameters and actuator parameters from a rigid body kinematic.
+
+#     Parameters
+#     ----------
+#     kinematic : RigidBody
+#         The kinematic from which to extract the parameters.
+
+#     Returns
+#     -------
+#     dict[str, torch.Tensor]
+#         The parameters from the kinematic (requires_grad is True).
+#     """
+
+#     parameters_dict = {
+#         "heliostat_position_enu_4d": kinematic.position,
+#         "first_joint_translation_e": kinematic.deviation_parameters.first_joint_translation_e,
+#         "first_joint_translation_n": kinematic.deviation_parameters.first_joint_translation_n,
+#         "first_joint_translation_u": kinematic.deviation_parameters.first_joint_translation_u,
+#         "first_joint_tilt_e": kinematic.deviation_parameters.first_joint_tilt_e,
+#         "first_joint_tilt_n": kinematic.deviation_parameters.first_joint_tilt_n,
+#         "first_joint_tilt_u": kinematic.deviation_parameters.first_joint_tilt_u,
+#         "second_joint_translation_e": kinematic.deviation_parameters.second_joint_translation_e,
+#         "second_joint_translation_n": kinematic.deviation_parameters.second_joint_translation_n,
+#         "second_joint_translation_u": kinematic.deviation_parameters.second_joint_translation_u,
+#         "second_joint_tilt_e": kinematic.deviation_parameters.second_joint_tilt_e,
+#         "second_joint_tilt_n": kinematic.deviation_parameters.second_joint_tilt_n,
+#         "second_joint_tilt_u": kinematic.deviation_parameters.second_joint_tilt_u,
+#         "concentrator_translation_e": kinematic.deviation_parameters.concentrator_translation_e,
+#         "concentrator_translation_n": kinematic.deviation_parameters.concentrator_translation_n,
+#         "concentrator_translation_u": kinematic.deviation_parameters.concentrator_translation_u,
+#         "concentrator_tilt_e": kinematic.deviation_parameters.concentrator_tilt_e,
+#         "concentrator_tilt_n": kinematic.deviation_parameters.concentrator_tilt_n,
+#         "concentrator_tilt_u": kinematic.deviation_parameters.concentrator_tilt_u,
+#         "actuator1_increment": kinematic.actuators.actuator_list[0].increment,
+#         "actuator1_initial_stroke_length": kinematic.actuators.actuator_list[0].initial_stroke_length,
+#         "actuator1_offset": kinematic.actuators.actuator_list[0].offset,
+#         "actuator1_pivot_radius": kinematic.actuators.actuator_list[0].pivot_radius,
+#         "actuator1_initial_angle": kinematic.actuators.actuator_list[0].initial_angle,
+#         "actuator2_increment": kinematic.actuators.actuator_list[1].increment,
+#         "actuator2_initial_stroke_length": kinematic.actuators.actuator_list[1].initial_stroke_length,
+#         "actuator2_offset": kinematic.actuators.actuator_list[1].offset,
+#         "actuator2_pivot_radius": kinematic.actuators.actuator_list[1].pivot_radius,
+#         "actuator2_initial_angle": kinematic.actuators.actuator_list[1].initial_angle,
+#     }
 
     for parameter in parameters_dict.values():
         if parameter is not None:

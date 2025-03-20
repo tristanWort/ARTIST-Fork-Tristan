@@ -119,8 +119,18 @@ class HeliostatField(torch.nn.Module):
         self.all_preferred_reflection_directions = torch.zeros((all_surface_points.shape[0], 4), device=device)
         self.all_current_aligned_surface_points = torch.zeros_like(all_surface_points, device=device)
         self.all_current_aligned_surface_normals = torch.zeros_like(all_surface_normals, device=device)
+        
+        self.rigid_body_kinematic = RigidBody(
+            number_of_heliostats=self.number_of_heliostats,
+            heliostat_positions=self.all_heliostat_positions,
+            aim_points=self.all_aim_points,
+            actuator_parameters=self.all_actuator_parameters,
+            initial_orientations=self.all_initial_orientations,
+            deviation_parameters=self.all_kinematic_deviation_parameters,
+            device=device
+        )
        
-
+       
     @classmethod
     def from_hdf5(
         cls,
@@ -159,7 +169,7 @@ class HeliostatField(torch.nn.Module):
 
         number_of_heliostats = len(config_file[config_dictionary.heliostat_key])
 
-        # TODO 10000 ersetzen
+        # TODO substitute 10000 or flexible surface variable (Marlene)
         number_of_surface_points_per_heliostat = 40000
         all_heliostat_names = []
         all_heliostat_positions = torch.zeros((number_of_heliostats, 4), device=device)
@@ -168,7 +178,7 @@ class HeliostatField(torch.nn.Module):
         all_surface_normals = torch.zeros((number_of_heliostats, number_of_surface_points_per_heliostat, 4), device=device)
         all_initial_orientations = torch.zeros((number_of_heliostats, 4), device=device)
         
-        # TODO unterschiedliche Parameter Längen
+        # TODO unterschiedliche Parameter Längen (Marlene)
         all_kinematic_deviation_parameters = torch.zeros((number_of_heliostats, 18), device=device)
         all_actuator_parameters = torch.zeros((number_of_heliostats, 7, 2), device=device)
 
@@ -280,20 +290,20 @@ class HeliostatField(torch.nn.Module):
         device : Union[torch.device, str]
             The device on which to initialize tensors (default is cuda).
         """
-        rigid_body_kinematic = RigidBody(
-            number_of_heliostats=self.number_of_heliostats,
-            heliostat_positions=self.all_heliostat_positions,
-            aim_points=self.all_aim_points,
-            actuator_parameters=self.all_actuator_parameters,
-            initial_orientations=self.all_initial_orientations,
-            deviation_parameters=self.all_kinematic_deviation_parameters,
-            device=device
-        )
+        # rigid_body_kinematic = RigidBody(
+        #     number_of_heliostats=self.number_of_heliostats,
+        #     heliostat_positions=self.all_heliostat_positions,
+        #     aim_points=self.all_aim_points,
+        #     actuator_parameters=self.all_actuator_parameters,
+        #     initial_orientations=self.all_initial_orientations,
+        #     deviation_parameters=self.all_kinematic_deviation_parameters,
+        #     device=device
+        # )
         device = torch.device(device)
         (
             self.all_current_aligned_surface_points,
             self.all_current_aligned_surface_normals,
-        ) = rigid_body_kinematic.align_surfaces_with_incident_ray_direction(
+        ) = self.rigid_body_kinematic.align_surfaces_with_incident_ray_direction(
             incident_ray_direction, self.all_surface_points, self.all_surface_normals, device
         )
         self.all_aligned_heliostats = torch.ones_like(self.all_aligned_heliostats)

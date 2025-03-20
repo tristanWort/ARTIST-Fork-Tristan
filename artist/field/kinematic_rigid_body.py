@@ -94,8 +94,8 @@ class RigidBody(Kinematic):
         self.artist_standard_orientation = torch.tensor(
             [0.0, -1.0, 0.0, 0.0], device=device
         )
-
-        # TODO nicht nur Linear erlauben?
+        
+        self.actuator_parameters = actuator_parameters
         self.actuators = LinearActuators(
             clockwise_axis_movements=actuator_parameters[:, 1],
             increments=actuator_parameters[:, 2],
@@ -313,21 +313,6 @@ class RigidBody(Kinematic):
             incident_ray_direction,
             max_num_iterations=10, device=device
         )
-        # orientation = torch.tensor(
-        #     [
-        #         [[9.9300e-01, -5.1613e-09, -1.1808e-01, 1.1657e+01],
-        #          [-1.0033e-01, 5.2732e-01, -8.4372e-01, 2.4607e+01],
-        #          [6.2265e-02, 8.4966e-01, 5.2364e-01, 2.1236e+00],
-        #          [0.0000e+00, 0.0000e+00, 0.0000e+00, 1.0000e+00]],
-        #         [[ 9.9959e-01,  1.2510e-09,  2.8619e-02, -5.5920e+00],
-        #         [ 2.7417e-02,  2.8675e-01, -9.5761e-01,  7.9919e+01],
-        #         [-8.2065e-03,  9.5801e-01,  2.8663e-01,  1.9828e+00],
-        #         [ 0.0000e+00,  0.0000e+00,  0.0000e+00,  1.0000e+00]]
-        #     ],
-        #     device=device
-        # )
-        print("Orientation:")
-        print(orientation)
 
         aligned_surface_points = surface_points @ orientation.transpose(1, 2)
         aligned_surface_normals = surface_normals @ orientation.transpose(1, 2)
