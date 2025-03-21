@@ -200,7 +200,7 @@ class CalibrationModel(nn.Module):
                 # print(f"\tRaytrace Sample {sample} of {len(calibration_ids)}")
                 # Use motor positions to get the concentrator orientation.
                 # single_batch = self.calibration_data_loader.get_single_item(calib_id)
-                orientation = self.heliostat.kinematic.motor_positions_to_orientation(
+                orientation = self.heliostat_field.rigid_body_kinematic.motor_positions_to_orientation(
                     motor_positions=batch['motor_positions'][sample],
                     device=device
                 )

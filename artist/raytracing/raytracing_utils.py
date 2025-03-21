@@ -89,8 +89,8 @@ def line_plane_intersections(
     # This determines how much the ray aligns with the plane normal.
     relative_intensities = - rays.ray_directions @ plane_normal_vector
 
-    if (relative_intensities <= epsilon).all():
-        raise ValueError("No ray hits the front of the receiver.")
+    # if (relative_intensities <= epsilon).all():
+    #     raise ValueError("No ray hits the front of the receiver.")
 
     # Calculate the intersections on the plane of each ray.
     # First, calculate the projection of the ray origin onto the plane’s normal.

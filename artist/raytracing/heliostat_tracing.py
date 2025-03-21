@@ -294,7 +294,7 @@ class HeliostatRayTracer:
         self.distortions_dataset = DistortionsDataset(
             light_source=scenario.light_sources.light_source_list[0],
             number_of_points_per_heliostat=self.number_of_surface_points_per_heliostat,
-            number_of_heliostats=1,  # distortians need to be loaded for each helisotat separately
+            number_of_heliostats=self.scenario.heliostat_field.number_of_heliostats,  # distortians need to be loaded for each helisotat separately
             random_seed=random_seed,
         )
         # Create restricted distributed sampler.
@@ -323,15 +323,22 @@ class HeliostatRayTracer:
         """
         Perform heliostat raytracing.
 
-        Scatter the rays according to the distortions, calculate the line plane intersection, and calculate the
-        resulting bitmap on the target area.
+        Scatter the rays according to the distortions, calculate the intersection with the target plane,
+        and sample the resulting bitmap on the target area.
 
         Parameters
         ----------
         incident_ray_direction : torch.Tensor
             The direction of the incident ray as seen from the heliostat.
+        target_area : TargetArea
+            The target area used to sample the bitmap on.
         device : Union[torch.device, str]
             The device on which to initialize tensors (default is cuda).
+
+        Raises
+        ------
+        ValueError
+            If not all heliostats used for raytracing have been aligned.
 
         Returns
         -------
@@ -340,57 +347,504 @@ class HeliostatRayTracer:
         """
         device = torch.device(device)
 
+        final_bitmap = torch.zeros(
+            (self.bitmap_resolution_u, self.bitmap_resolution_e), device=device
+        )
+        
         final_bitmaps = torch.zeros(
-            (self.batch_size, self.bitmap_resolution_u, self.bitmap_resolution_e), device=device
+            (self.scenario.heliostat_field.number_of_heliostats, self.bitmap_resolution_u, self.bitmap_resolution_e), device=device
         )
 
-        if not torch.all(self.scenario.heliostat_field.all_aligned_heliostats == 1):
+        if not torch.all(self.scenario.heliostat_field.all_aligned_heliostats == 1.0):
             raise ValueError("Not all heliostats have been aligned.")
-        self.scenario.heliostat_field.all_preferred_reflection_directions = raytracing_utils.reflect_all(
+
+        self.scenario.heliostat_field.all_preferred_reflection_directions = raytracing_utils.reflect(
             incoming_ray_direction=incident_ray_direction,
-            reflection_surface_normals=self.scenario.heliostat_field.all_current_aligned_surface_normals
+            reflection_surface_normals=self.scenario.heliostat_field.all_current_aligned_surface_normals,
+        )
+
+        for batch_index, (batch_u, batch_e) in enumerate(self.distortions_loader):
+            sampler_indices = list(self.distortions_sampler)
+
+            heliostat_indices_per_batch = sampler_indices[
+                batch_index * self.batch_size : (batch_index + 1) * self.batch_size
+            ]
+
+            rays = self.scatter_rays(
+                batch_u, batch_e, heliostat_indices_per_batch, device
             )
 
-        # TODO: using one batch for each heliostat is a bit of a hack, but it works for now
-        for _, (batch_u, batch_e) in enumerate(self.distortions_loader):
-            
-            for batch_index in range(self.batch_size):  # only batch one heliostat         
-            
-                heliostat_indices = [batch_index]
-                
-                rays = self.scatter_rays(batch_u, batch_e, heliostat_indices, device)
-
-                intersections, absolute_intensities = raytracing_utils.line_plane_intersections(
+            intersections, absolute_intensities = (
+                raytracing_utils.line_plane_intersections(
                     rays=rays,
                     plane_normal_vector=target_area.normal_vector,
                     plane_center=target_area.center,
-                    points_at_ray_origin=self.scenario.heliostat_field.all_current_aligned_surface_points[heliostat_indices],
+                    points_at_ray_origin=self.scenario.heliostat_field.all_current_aligned_surface_points[
+                        heliostat_indices_per_batch
+                    ],
                 )
-                #torch.cuda.empty_cache()
+            )
 
-                dx_intersections = (
-                    intersections[:, :, :, 0]
-                    + target_area.plane_e / 2
-                    - target_area.center[0]
+            dx_intersections = (
+                intersections[:, :, :, 0]
+                + target_area.plane_e / 2
+                - target_area.center[0]
+            )
+            dy_intersections = (
+                intersections[:, :, :, 2]
+                + target_area.plane_u / 2
+                - target_area.center[2]
+            )
+
+            intersection_indices = (
+                (-1 <= dx_intersections)
+                & (dx_intersections < target_area.plane_e + 1)
+                & (-1 <= dy_intersections)
+                & (dy_intersections < target_area.plane_u + 1)
+            )
+
+            total_bitmap = self.sample_bitmap(
+                target_area=target_area,
+                dx_intersections=dx_intersections,
+                dy_intersections=dy_intersections,
+                intersection_indices=intersection_indices,
+                absolute_intensities=absolute_intensities,
+                device=device,
+            )
+
+            final_bitmap = final_bitmap + total_bitmap
+
+        return final_bitmap
+    
+    # def trace_rays_multi_sun(
+    #     self,
+    #     incident_ray_directions: torch.Tensor,  # Shape: [H, S, 4]
+    #     target_areas: list[list[TargetArea]],  # Shape: [H, S]
+    #     device: Union[torch.device, str] = "cuda",
+    # ) -> torch.Tensor:  # Shape: [H, S, bitmap_resolution_u, bitmap_resolution_e]
+    #     """
+    #     Perform heliostat raytracing for multiple sun positions per heliostat.
+        
+    #     Parameters
+    #     ----------
+    #     incident_ray_directions : torch.Tensor
+    #         The directions of the incident rays. Either shape [H, S, 3] for heliostat-specific
+    #         sun positions, or shape [S, 3] for global sun positions applied to all heliostats.
+    #     target_area : TargetArea
+    #         The target area used to sample the bitmap on.
+    #     device : Union[torch.device, str]
+    #         The device on which to initialize tensors (default is cuda).
+            
+    #     Returns
+    #     -------
+    #     torch.Tensor
+    #         The resulting bitmaps for each heliostat and sun position combination.
+    #     """
+    #     device = torch.device(device)
+        
+    #     # Determine if we have heliostat-specific sun positions
+    #     heliostat_specific = (incident_ray_directions.dim() == 4)
+        
+    #     num_heliostats = self.scenario.heliostat_field.number_of_heliostats
+    #     num_sun_positions = incident_ray_directions.shape[1]
+        
+    #     # Initialize results tensor
+    #     bitmaps = torch.zeros(
+    #         (num_heliostats, num_sun_positions, self.bitmap_resolution_u, self.bitmap_resolution_e), 
+    #         device=device
+    #     )
+        
+    #     # Process each heliostat-sun position combination
+    #     for h_idx in range(num_heliostats):
+            
+    #         # Store original heliostat field properties we'll need to restore
+    #         orig_surface_points = self.scenario.heliostat_field.all_current_aligned_surface_points.clone()
+    #         orig_surface_normals = self.scenario.heliostat_field.all_current_aligned_surface_normals.clone()
+            
+    #         # Create a temporary single-heliostat field (with the current heliostat only)
+    #         temp_points = orig_surface_points[h_idx:h_idx+1]
+    #         temp_normals = orig_surface_normals[h_idx:h_idx+1]
+            
+    #         # Temporarily modify heliostat field to contain only this heliostat
+    #         self.scenario.heliostat_field.all_current_aligned_surface_points = temp_points
+    #         self.scenario.heliostat_field.all_current_aligned_surface_normals = temp_normals
+            
+    #         for s_idx in range(num_sun_positions):
+    #             # Get the appropriate sun direction for this heliostat and sun position
+    #             sun_dir = incident_ray_directions[h_idx, s_idx]
+                
+    #             # Trace rays for this heliostat and sun position
+    #             bitmap = self.trace_rays(sun_dir, target_areas[h_idx], device)
+                
+    #             # Store the result
+    #             bitmaps[h_idx, s_idx] = bitmap
+            
+    #         # Restore original heliostat field properties
+    #         self.scenario.heliostat_field.all_current_aligned_surface_points = orig_surface_points
+    #         self.scenario.heliostat_field.all_current_aligned_surface_normals = orig_surface_normals
+        
+    #     return bitmaps
+    
+    def trace_rays_unique_sun(
+        self,
+        incident_ray_directions: torch.Tensor,  # Shape: [H, 3] - one direction per heliostat
+        target_area: TargetArea,
+        device: Union[torch.device, str] = "cuda",
+    ) -> torch.Tensor:  # Shape: [H, bitmap_resolution_u, bitmap_resolution_e]
+        """
+        Perform heliostat raytracing with a unique sun position for each heliostat.
+
+        Parameters
+        ----------
+        incident_ray_directions : torch.Tensor
+            The directions of the incident rays with shape [H, 3], providing a unique
+            sun position for each heliostat.
+        target_area : TargetArea
+            The target area used to sample the bitmap on.
+        device : Union[torch.device, str]
+            The device on which to initialize tensors (default is cuda).
+
+        Returns
+        -------
+        torch.Tensor
+            The resulting bitmaps for each heliostat with shape [H, bitmap_resolution_u, bitmap_resolution_e].
+        """
+        device = torch.device(device)
+        num_heliostats = self.scenario.heliostat_field.number_of_heliostats
+        
+        # Validate input shape
+        if incident_ray_directions.shape != (num_heliostats, 4):
+            raise ValueError(f"Expected incident_ray_directions with shape [{num_heliostats}, 4], "
+                            f"but got {incident_ray_directions.shape}")
+        
+        # Initialize result tensor - one bitmap per heliostat
+        final_bitmaps = torch.zeros(
+            (num_heliostats, self.bitmap_resolution_u, self.bitmap_resolution_e), 
+            device=device
+        )
+
+        if not torch.all(self.scenario.heliostat_field.all_aligned_heliostats == 1.0):
+            raise ValueError("Not all heliostats have been aligned.")
+
+        # Calculate the preferred reflection directions for each heliostat with its unique sun direction
+        # We calculate this once for all heliostats to leverage GPU parallelism
+        self.scenario.heliostat_field.all_preferred_reflection_directions = raytracing_utils.reflect(
+            incoming_ray_direction=incident_ray_directions.unsqueeze(1),  # Shape: [H, 1, 4]
+            reflection_surface_normals=self.scenario.heliostat_field.all_current_aligned_surface_normals
+        )
+
+        # Process heliostats in batches using the distortions loader
+        for batch_index, (batch_u, batch_e) in enumerate(self.distortions_loader):
+            # Get the heliostat indices for this batch
+            sampler_indices = list(self.distortions_sampler)
+            heliostat_indices = sampler_indices[
+                batch_index * self.batch_size : (batch_index + 1) * self.batch_size
+            ]
+            
+            if not heliostat_indices:
+                continue  # Skip empty batches
+
+            # Scatter rays for the current batch of heliostats
+            rays = self.scatter_rays(
+                batch_u, batch_e, heliostat_indices, device
+            )
+
+            # Get surface points for current batch of heliostats
+            batch_surface_points = self.scenario.heliostat_field.all_current_aligned_surface_points[
+                heliostat_indices
+            ]
+
+            # Calculate intersections with the target plane
+            intersections, absolute_intensities = raytracing_utils.line_plane_intersections(
+                rays=rays,
+                plane_normal_vector=target_area.normal_vector,
+                plane_center=target_area.center,
+                points_at_ray_origin=batch_surface_points
+            )
+
+            # Calculate positions on the target plane
+            dx_intersections = (
+                intersections[:, :, :, 0]
+                + target_area.plane_e / 2
+                - target_area.center[0]
+            )
+            dy_intersections = (
+                intersections[:, :, :, 2]
+                + target_area.plane_u / 2
+                - target_area.center[2]
+            )
+
+            # Determine valid intersections
+            intersection_indices = (
+                (-1 <= dx_intersections)
+                & (dx_intersections < target_area.plane_e + 1)
+                & (-1 <= dy_intersections)
+                & (dy_intersections < target_area.plane_u + 1)
+            )
+
+            # Process each heliostat in the batch
+            for batch_idx, global_idx in enumerate(heliostat_indices):
+                # Sample bitmap for this specific heliostat
+                heliostat_bitmap = self.sample_bitmap(
+                    target_area=target_area,
+                    dx_intersections=dx_intersections[batch_idx],
+                    dy_intersections=dy_intersections[batch_idx],
+                    intersection_indices=intersection_indices[batch_idx],
+                    absolute_intensities=absolute_intensities[batch_idx],
+                    device=device
                 )
-                dy_intersections = (
-                    intersections[:, :, :, 2]
-                    + target_area.plane_u / 2
-                    - target_area.center[2]
-                )
-
-                intersection_indices = (
-                    (-1 <= dx_intersections)
-                    & (dx_intersections < target_area.plane_e + 1)
-                    & (-1 <= dy_intersections)
-                    & (dy_intersections < target_area.plane_u + 1)
-                )
-
-                total_bitmap = self.sample_bitmap(target_area, dx_intersections, dy_intersections, intersection_indices, absolute_intensities, device=device)
-
-                final_bitmaps[batch_index] = total_bitmap
+                
+                # Store the bitmap in the result tensor
+                final_bitmaps[global_idx] += heliostat_bitmap
 
         return final_bitmaps
+    
+    def trace_rays_multi_sun(
+    self,
+    incident_ray_directions: torch.Tensor,  # Shape: [H, S, 3]
+    target_area: TargetArea,
+    device: Union[torch.device, str] = "cuda",
+    ) -> torch.Tensor:  # Shape: [H, S, bitmap_resolution_u, bitmap_resolution_e]
+        """
+        Perform heliostat raytracing for multiple sun positions in parallel.
+
+        Parameters
+        ----------
+        incident_ray_directions : torch.Tensor
+            The directions of the incident rays. Either shape [S, 3] for global sun positions,
+            or shape [H, S, 3] for heliostat-specific sun positions.
+        target_area : TargetArea
+            The target area used to sample the bitmap on.
+        device : Union[torch.device, str]
+            The device on which to initialize tensors (default is cuda).
+
+        Returns
+        -------
+        torch.Tensor
+            The resulting bitmaps for each heliostat and sun position combination.
+        """
+        device = torch.device(device)
+
+        # Determine dimensions
+        num_heliostats = self.scenario.heliostat_field.number_of_heliostats
+        heliostat_specific = (incident_ray_directions.dim() == 3)
+        
+        num_sun_positions = incident_ray_directions.shape[1]
+        # Ensure incident_ray_directions has shape [H, S, 3]
+        if incident_ray_directions.shape[0] != num_heliostats:
+            raise ValueError(f"Expected incident_ray_directions to have first dimension of size {num_heliostats}")
+        else:
+            num_sun_positions = incident_ray_directions.shape[0]
+            # Expand incident_ray_directions to [H, S, 3]
+            incident_ray_directions = incident_ray_directions.unsqueeze(0).expand(num_heliostats, -1, -1)
+
+        # Initialize results tensor: [H, S, bitmap_u, bitmap_e]
+        final_bitmap = torch.zeros(
+            (num_heliostats, num_sun_positions, self.bitmap_resolution_u, self.bitmap_resolution_e), 
+            device=device
+        )
+
+        if not torch.all(self.scenario.heliostat_field.all_aligned_heliostats == 1.0):
+            raise ValueError("Not all heliostats have been aligned.")
+
+        # For convenience, let's define:
+        # H = num_heliostats
+        # S = num_sun_positions
+        # F = number of facets per heliostat (currently implicit in surface points)
+        # SP = num_surface_points per facet/heliostat
+        # 3 = the three dimensions (x, y, z)
+
+        # Reshape surface points and normals
+        # Current shape: [H, SP, 3]
+        # Desired shape: [H, 1, 1, SP, 3] for broadcasting with S dimension
+        surface_points = self.scenario.heliostat_field.all_current_aligned_surface_points
+        surface_points = surface_points.unsqueeze(1).unsqueeze(1)  # Shape: [H, 1, 1, SP, 3]
+        
+        surface_normals = self.scenario.heliostat_field.all_current_aligned_surface_normals
+        surface_normals = surface_normals.unsqueeze(1).unsqueeze(1)  # Shape: [H, 1, 1, SP, 3]
+
+        # Reshape incident_ray_directions for broadcasting
+        # Current shape: [H, S, 3]
+        # Desired shape: [H, S, 1, 1, 3] for broadcasting with SP dimension
+        incident_ray_directions = incident_ray_directions.unsqueeze(2).unsqueeze(2)  # Shape: [H, S, 1, 1, 3]
+
+        # Calculate preferred reflection directions for all combinations: [H, S, 1, SP, 3]
+        preferred_reflection_directions = raytracing_utils.reflect(
+            incoming_ray_direction=incident_ray_directions,
+            reflection_surface_normals=surface_normals
+        )
+
+        # Store for later use
+        self.scenario.heliostat_field.all_preferred_reflection_directions = preferred_reflection_directions.squeeze(2)
+
+        # Now we need to handle distortions for all heliostats and all sun positions
+        # We'll create expanded distortions that can be applied to all sun positions
+        
+        # Iterate through distortion batches to avoid memory issues
+        for batch_index, (batch_u, batch_e) in enumerate(self.distortions_loader):
+            sampler_indices = list(self.distortions_sampler)
+            heliostat_indices_per_batch = sampler_indices[
+                batch_index * self.batch_size : (batch_index + 1) * self.batch_size
+            ]
+            
+            if not heliostat_indices_per_batch:
+                continue  # Skip empty batches
+                
+            # Reshape distortions to broadcast across sun positions
+            # Current shape: [batch_size, SP]
+            # Desired shape: [batch_size, 1, SP] for broadcasting with S dimension
+            batch_u = batch_u.unsqueeze(1)  # Shape: [batch_size, 1, SP]
+            batch_e = batch_e.unsqueeze(1)  # Shape: [batch_size, 1, SP]
+            
+            # Expand distortions to handle all sun positions
+            # New shape: [batch_size, S, SP]
+            batch_u = batch_u.expand(-1, num_sun_positions, -1)
+            batch_e = batch_e.expand(-1, num_sun_positions, -1)
+            
+            # Generate scattered rays for this batch of heliostats and all sun positions
+            scattered_rays = self.scatter_rays_multi_sun(
+                distortion_u=batch_u,
+                distortion_e=batch_e,
+                heliostat_indices=heliostat_indices_per_batch,
+                preferred_directions=preferred_reflection_directions[heliostat_indices_per_batch],
+                num_sun_positions=num_sun_positions,
+                device=device
+            )
+            
+            # Process surface points for this batch
+            batch_surface_points = surface_points[heliostat_indices_per_batch]  # Shape: [batch_size, 1, 1, SP, 3]
+            
+            # Calculate intersections for all rays in this batch
+            # Current shape of scattered_rays.ray_directions: [batch_size, S, SP, 3]
+            # Current shape of batch_surface_points: [batch_size, 1, 1, SP, 3]
+            # Need to match dimensions for line_plane_intersections
+            batch_surface_points = batch_surface_points.expand(-1, num_sun_positions, -1, -1, -1).squeeze(2)
+            
+            intersections, absolute_intensities = raytracing_utils.line_plane_intersections(
+                rays=scattered_rays,
+                plane_normal_vector=target_area.normal_vector,
+                plane_center=target_area.center,
+                points_at_ray_origin=batch_surface_points  # Shape: [batch_size, S, SP, 3]
+            )
+            
+            # Calculate positions on the target plane
+            dx_intersections = (
+                intersections[:, :, :, 0]
+                + target_area.plane_e / 2
+                - target_area.center[0]
+            )
+            dy_intersections = (
+                intersections[:, :, :, 2]
+                + target_area.plane_u / 2
+                - target_area.center[2]
+            )
+            
+            # Determine valid intersections
+            intersection_indices = (
+                (-1 <= dx_intersections)
+                & (dx_intersections < target_area.plane_e + 1)
+                & (-1 <= dy_intersections)
+                & (dy_intersections < target_area.plane_u + 1)
+            )
+            
+            # Process each heliostat and sun position separately for the bitmap sampling
+            # (This part is hard to vectorize efficiently)
+            for h_idx_batch, h_idx_global in enumerate(heliostat_indices_per_batch):
+                for s_idx in range(num_sun_positions):
+                    # Sample bitmap for this specific heliostat and sun position
+                    h_bitmap = self.sample_bitmap(
+                        target_area=target_area,
+                        dx_intersections=dx_intersections[h_idx_batch, s_idx],
+                        dy_intersections=dy_intersections[h_idx_batch, s_idx],
+                        intersection_indices=intersection_indices[h_idx_batch, s_idx],
+                        absolute_intensities=absolute_intensities[h_idx_batch, s_idx],
+                        device=device
+                    )
+                    
+                    # Add to the final bitmap
+                    final_bitmap[h_idx_global, s_idx] += h_bitmap
+                    
+        return final_bitmap
+
+    def scatter_rays_multi_sun(
+        self,
+        distortion_u: torch.Tensor,  # Shape: [batch_size, S, SP]
+        distortion_e: torch.Tensor,  # Shape: [batch_size, S, SP]
+        heliostat_indices: list,
+        preferred_directions: torch.Tensor,  # Shape: [batch_size, S, 1, SP, 3]
+        num_sun_positions: int,
+        device: Union[torch.device, str] = "cuda",
+    ) -> Rays:
+        """
+        Scatter the reflected rays for multiple sun positions per heliostat.
+        
+        Parameters
+        ----------
+        distortion_u : torch.Tensor
+            The distortions in up direction for all heliostats and sun positions.
+        distortion_e : torch.Tensor
+            The distortions in east direction for all heliostats and sun positions.
+        heliostat_indices : list
+            The indices of the heliostats considered in the current batch.
+        preferred_directions : torch.Tensor
+            The preferred reflection directions for all heliostats and sun positions.
+        num_sun_positions : int
+            The number of sun positions being processed.
+        device : Union[torch.device, str]
+            The device on which to initialize tensors.
+            
+        Returns
+        -------
+        Rays
+            Scattered rays around the preferred directions for all heliostats and sun positions.
+        """
+        device = torch.device(device)
+        batch_size = len(heliostat_indices)
+        
+        # Reshape preferred directions to match the distortions
+        # Current shape: [batch_size, S, 1, SP, 3]
+        # Needed shape: [batch_size, S, SP, 3]
+        preferred_directions = preferred_directions.squeeze(2)  # Shape: [batch_size, S, SP, 3]
+        
+        # Process each sun position to avoid memory issues
+        all_scattered_rays = []
+        all_ray_magnitudes = []
+        
+        for s_idx in range(num_sun_positions):
+            # Get distortions for this sun position
+            u_distortions = distortion_u[:, s_idx]  # Shape: [batch_size, SP]
+            e_distortions = distortion_e[:, s_idx]  # Shape: [batch_size, SP]
+            
+            # Calculate rotation matrices for the distortions
+            rotations = utils.rotate_distortions(
+                u=u_distortions, e=e_distortions, device=device
+            )  # Shape: [batch_size, SP, 3, 3]
+            
+            # Get preferred directions for this sun position
+            pref_dir = preferred_directions[:, s_idx]  # Shape: [batch_size, SP, 3]
+            
+            # Apply rotations to get scattered rays
+            # Need to reshape for matrix multiplication
+            pref_dir_reshaped = pref_dir.unsqueeze(-1)  # Shape: [batch_size, SP, 3, 1]
+            
+            # Perform the rotation
+            scattered = torch.matmul(rotations, pref_dir_reshaped)  # Shape: [batch_size, SP, 3, 1]
+            scattered_rays = scattered.squeeze(-1)  # Shape: [batch_size, SP, 3]
+            
+            # Create ray magnitudes (all ones in this case)
+            ray_magnitudes = torch.ones(scattered_rays.shape[:-1], device=device)  # Shape: [batch_size, SP]
+            
+            all_scattered_rays.append(scattered_rays)
+            all_ray_magnitudes.append(ray_magnitudes)
+        
+        # Stack the results for all sun positions
+        scattered_rays = torch.stack(all_scattered_rays, dim=1)  # Shape: [batch_size, S, SP, 3]
+        ray_magnitudes = torch.stack(all_ray_magnitudes, dim=1)  # Shape: [batch_size, S, SP]
+        
+        return Rays(
+            ray_directions=scattered_rays,
+            ray_magnitudes=ray_magnitudes
+        )
 
     def scatter_rays(
         self,
@@ -421,7 +875,7 @@ class HeliostatRayTracer:
         rotations = utils.rotate_distortions(
             u=distortion_u, e=distortion_e, device=device
         )
-          
+            
         scattered_rays = (rotations @ self.scenario.heliostat_field.all_preferred_reflection_directions[heliostat_indices, :, :].unsqueeze(1).unsqueeze(-1)).squeeze(-1)
         
         return Rays(
