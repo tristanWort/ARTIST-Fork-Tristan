@@ -119,26 +119,31 @@ class CalibrationDataLoader:
             # TODO: Change so that only data paths are stored and not the data itself.
             for properties_file in properties_files:
                 calibration_id = int(''.join(filter(str.isdigit, Path(properties_file).name)))
-                self.calibration_ids[heliostat_id].append(calibration_id)
 
                 with open(properties_file, 'r') as file:
                     calibration_data = json.load(file)
+                
+                try:
+                    (
+                        calibration_target_name,
+                        spot_center,
+                        sun_position,
+                        motor_positions,
+                    ) = extract_paint_calibration_data(
+                        calibration_properties_path=Path(properties_file),
+                        power_plant_position=self.power_plant_position,
+                        device=self.device
+                    )
+                except KeyError:
+                    log.warning(f"Missing calibration data in {properties_file}. Skipping this file.")
+                    continue
+                
+                self.calibration_ids[heliostat_id].append(calibration_id)
                 self.sun_azimuths[calibration_id] = calibration_data['sun_azimuth']
                 self.sun_elevations[calibration_id] = calibration_data['sun_elevation']
-
-                (
-                    calibration_target_name,
-                    spot_centers,
-                    incident_ray_direction,
-                    motor_positions,
-                ) = extract_paint_calibration_data(
-                    calibration_properties_path=Path(properties_file),
-                    power_plant_position=self.power_plant_position,
-                    device=self.device
-                )
-                self.flux_centers[calibration_id] = spot_centers.to(self.device)
+                self.flux_centers[calibration_id] = spot_center.to(self.device)
                 self.motor_positions[calibration_id] = motor_positions.to(self.device)
-                self.incident_rays[calibration_id] = incident_ray_direction.to(self.device)
+                self.incident_rays[calibration_id] = torch.tensor([0.0, 0.0, 0.0, 1.0]).to(self.device) - sun_position.to(self.device)
                 self.receiver_targets[calibration_id] = calibration_target_name
 
                 if self.load_flux_images:
@@ -153,12 +158,12 @@ class CalibrationDataLoader:
                                                 f"{calibration_id + self.flux_file_ends_with}.")
             log.info(f"Loaded data for {len(self.calibration_ids[heliostat_id])} calibration IDs.")
 
-    def get_calibration_ids(self) -> List[str]:
+    def get_calibration_ids(self) -> Dict[str, int]:
         """
         Get all available calibration IDs.
 
         Returns:
-            List[str]: List of all calibration IDs
+            Dict[str, int]: Dict of all calibration IDs
         """
         return self.calibration_ids.copy()
 
@@ -205,6 +210,60 @@ class CalibrationDataLoader:
             batch_data['flux_images'] = batch_flux_images
 
         return batch_data
+    
+    def get_field_batch(self, heliostats_and_calib_ids: Dict[str, List[int]]) -> Dict[str, Dict[str, Union[torch.Tensor, List[str]]]]:
+        """
+        Get a batch of calibration data for the specified calibration IDs.
+
+        Args:
+            field_batch Dict[str, List[int]]: Dictionary of heliostat IDs (str) and calibration IDs (int) to include in the batch
+
+        Returns:
+            Dict: A dictionary containing batched data with the following keys:
+                - 'flux_centers': Tensor of shape [N, 4]
+                - 'motor_positions': Tensor of shape [N, 2]
+                - 'incident_rays': Tensor of shape [N, 4]
+                - 'receiver_targets': List of N target names
+                - 'flux_images': Tensor of shape [N, 256, 256]
+                - 'calibration_ids': List of N calibration IDs
+
+        Raises:
+            KeyError: If any of the requested calibration IDs are not available
+        """
+        # Check if all requested IDs are available
+        missing_ids = (set(batch_id for ids in heliostats_and_calib_ids.values() for batch_id in ids)
+                       - set(batch_id for ids in self.calibration_ids.values() for batch_id in ids))
+        if missing_ids:
+            raise KeyError(f"Calibration IDs not found in CalibrationDataLoader: {missing_ids}")
+
+        sample_length = len(next(iter(heliostats_and_calib_ids.values())))
+        
+        field_batch = list()
+        # Iterate over number of samples per heliostat
+        for sample in range(sample_length):
+            # Get the calibration id for one sample per heliostat
+            sample_ids = [cal_ids[sample] for cal_ids in heliostats_and_calib_ids.values()]
+            
+            sample_flux_centers = torch.stack([self.flux_centers[id] for id in sample_ids]).to(self.device)
+            sample_motor_positions = torch.stack([self.motor_positions[id] for id in sample_ids]).to(self.device)
+            sample_incident_rays = torch.stack([self.incident_rays[id] for id in sample_ids]).to(self.device)
+            sample_receiver_targets = [self.receiver_targets[id] for id in sample_ids]
+
+            sample_data = {'cal_ids': sample_ids,
+                          'sun_azimuths': [self.sun_azimuths[id] for id in sample_ids],
+                          'sun_elevations': [self.sun_elevations[id] for id in sample_ids],
+                          'flux_centers': sample_flux_centers,
+                          'motor_positions': sample_motor_positions,
+                          'incident_rays': sample_incident_rays,
+                          'receiver_targets': sample_receiver_targets}
+
+            if self.load_flux_images:
+                sample_flux_images = torch.stack([self.flux_images[id] for id in sample_ids]).to(self.device)
+                sample_data['flux_images'] = sample_flux_images
+                
+            field_batch.append(sample_data)
+
+        return field_batch
 
     def get_single_item(self, cal_id: str) -> Dict[str, Any]:
         """

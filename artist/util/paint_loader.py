@@ -236,7 +236,7 @@ def extract_paint_heliostats(
     heliostat_and_deflectometry_paths: list[tuple[str, pathlib.Path, pathlib.Path]],
     power_plant_position: torch.Tensor,
     aim_point: torch.Tensor,
-    max_epochs_for_surface_training: int = 400,
+    max_epochs_for_surface_training: int = 3000,
     device: Union[torch.device, str] = "cuda",
 ) -> tuple[HeliostatListConfig, PrototypeConfig]:
     """
@@ -285,6 +285,9 @@ def extract_paint_heliostats(
 
             # Generate surface configuration from data.
             surface_converter = SurfaceConverter(
+                number_eval_points_e=100,
+                number_eval_points_n=100,
+                tolerance=1e-5,
                 step_size=100,
                 max_epoch=max_epochs_for_surface_training,
             )

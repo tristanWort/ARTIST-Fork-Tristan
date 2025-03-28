@@ -19,19 +19,17 @@ def get_rigid_body_kinematic_parameters_from_scenario(
     -------
     dict[str, torch.Tensor]
         The parameters from the kinematic (requires_grad is True).
-    """
-
+    """    
     parameters_dict = {
         "all_heliostat_positions_enu_4d": kinematic.heliostat_positions,
         "all_kinematic_deviation_parameters": kinematic.deviation_parameters,
-        "actuators_clockwise_axis_movements": kinematic.actuators.clockwise_axis_movements,
         "actuators_increments": kinematic.actuators.increments,
         "actuators_initial_stroke_lengths": kinematic.actuators.initial_stroke_lengths,
         "actuators_offsets": kinematic.actuators.offsets,
         "actuators_pivot_radii": kinematic.actuators.pivot_radii,
         "actuators_initial_angles": kinematic.actuators.initial_angles,
     }
-
+    
     for parameter in parameters_dict.values():
         if parameter is not None:
             parameter.requires_grad_()

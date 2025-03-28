@@ -11,7 +11,7 @@ from paint.data.stac_client import StacClient
 set_logger_config()
 
 # Data will be downloaded to this path.
-download_path = Path(r"/jump/tw/data/paint/metadata/")
+download_path = Path(r"/dss/dsshome1/05/di38kid/data/paint")
 
 # Read in arguments for command line passing.
 parser = argparse.ArgumentParser()
@@ -56,7 +56,7 @@ parser.add_argument(
     type=str,
     help="List of heliostats to be downloaded.",
     nargs="+",
-    default=["AA39", "AM35"],
+    default=["AA39", "AC27", "AD43", "AM35", "BB72", "BG24"],
 )
 
 # Add arguments to the parser specifying the collections to be downloaded.
@@ -95,7 +95,7 @@ args = parser.parse_args()
 client = StacClient(output_dir=args.output_dir)
 
 # Download the tower measurements.
-# client.get_tower_measurements()
+client.get_tower_measurements()
 
 # Download the weather data within the given time period.
 # client.get_weather_data(
@@ -105,12 +105,12 @@ client = StacClient(output_dir=args.output_dir)
 # )
 
 # Download heliostat data for the given heliostats, the specified collections and calibration items.
-# client.get_heliostat_data(
-#     heliostats=args.heliostats,
-#     collections=args.collections,
-#     filtered_calibration_keys=args.filtered_calibration,
-# )
+client.get_heliostat_data(
+    heliostats=args.heliostats,
+    collections=args.collections,
+    filtered_calibration_keys=args.filtered_calibration,
+)
 
 # Download metadata for all heliostats. Will not be used in this script.
 # WARNING: Running the following command with 'heliostats=None' will take a very long time!
-client.get_heliostat_metadata(heliostats=['AA39', 'AM35'])
+client.get_heliostat_metadata(heliostats=["AA39", "AC27", "AD43", "AM35", "BB72", "BG24"])

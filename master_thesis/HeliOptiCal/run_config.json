@@ -1,20 +1,20 @@
 {
     "run": {
-        "scenario_path": "/jump/tw/data/paint/_h5_scenario_files/250306-0952_scenario_AA39-AM35.h5",
-        "heliostats": ["AA39", "AM35"],
-        "paint_dir": "/jump/tw/data/paint", 
+        "scenario_path": "/dss/dsshome1/05/di38kid/data/scenarios/20250325_scenario_7heliostats.h5",
+        "heliostats": ["AA39", "AC27", "AD43", "AM35", "BB72", "BG24"],
+        "paint_dir": "/dss/dsshome1/05/di38kid/data/paint/", 
         "random_seed": 42,
-        "device": "cpu"
+        "device": "cuda:0"
     },
     "model": {
-        "init_learning_rate": [0.00001],
+        "init_learning_rate": [0.001],
         "parameter_grouping": [],
         "optimizer_type": "Adam",
         "scheduler_type": "ReduceLROnPlateau"
     },
     "splits": {
-        "path_to_measurements": "/jump/tw/data/paint/metadata/calibration_metadata_selected_heliostats_20250319_113945.csv",
-        "output_dir": "/jump/tw/data/paint/splits/AA39-AM35",
+        "path_to_measurements": "/dss/dsshome1/05/di38kid/data/paint/metadata/calibration_metadata_selected_heliostats_20250325_150310.csv",
+        "output_dir": "/dss/dsshome1/05/di38kid/data/results",
         "training_sizes": [30],
         "validation_sizes": [30],
         "split_types": ["knn"]

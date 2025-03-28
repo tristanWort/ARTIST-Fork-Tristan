@@ -9,7 +9,108 @@ from pathlib import Path
 import time
 import matplotlib.pyplot as plt
 
+def contour_difference(predictions, targets, threshold=0.5, sharpness=20.0):
+    """
+    Compute the pixel-wise difference between contours of prediction and target image batches.
+    
+    Parameters:
+    - predictions: Tensor with shape (B, H, 256, 256), values ∈ [0, 1]
+    - targets: Tensor with shape (B, H, 256, 256), values ∈ [0, 1]
+    - threshold: Threshold for contour extraction
+    - sharpness: Steepness of the soft threshold
+    
+    Returns:
+    - Difference bitmaps tensor with shape (B, H, 256, 256)
+    """
+    batch_size, height, width, width2 = predictions.shape
+    assert width == width2 == 256, "Width dimensions must be 256x256"
+    assert predictions.shape == targets.shape, "Prediction and target shapes must match"
+    
+    # Initialize the output tensor for difference bitmaps
+    device = predictions.device
+    difference_maps = torch.zeros_like(predictions, device=device)
+    
+    # Process each image in the batch
+    for b in range(batch_size):
+        for h in range(height):
+            # Extract individual images
+            pred_img = predictions[b, h]  # Shape: (256, 256)
+            target_img = targets[b, h]    # Shape: (256, 256)
+            
+            # Find contours using the provided function
+            pred_contour = find_soft_contour_pytorch_vertical(pred_img, threshold, sharpness)  # Shape: (1, 256, 256)
+            target_contour = find_soft_contour_pytorch_vertical(target_img, threshold, sharpness)  # Shape: (1, 256, 256)
+            
+            # Calculate absolute difference between contours
+            diff = torch.abs(pred_contour - target_contour)  # Shape: (1, 256, 256)
+            
+            # Store result in output tensor
+            difference_maps[b, h] = diff.squeeze(0)  # Remove channel dimension
+    
+    return difference_maps
 
+def find_soft_contour_pytorch_vertical(tensor_img, threshold=0.5, sharpness=20.0):
+    """
+    Differentiable contour extraction for vertical edges. Two convolutions are applied.
+    First a Sobel kernel is used for edge detection. Then contours are extracted via soft erosion.
+
+    Parameters:
+   - tensor_img: Tensor with shape (1, H, W) or (H, W), values ∈ [0, 1]
+    - threshold: Threshold for "soft" binarization
+    - sharpness: Steepness of the soft threshold (higher ≈ sharper)
+
+    Returns:
+    - Soft contour mask (1, H, W), values ∈ [0, 1]
+    """
+    if tensor_img.dim() == 2:  # if batch size is missing
+        tensor_img = tensor_img.unsqueeze(0)  # → (1, H, W)
+
+    # First perform convolution for edge detection.
+    # Define a Sobel kernel for vertical edge detection
+    sobel_kernel = torch.tensor(
+        [[-1, -2, -1],
+                    [0, 0, 0],
+                    [1, 2, 1]],
+        device=tensor_img.device).float().view(1, 1, 3, 3)
+
+    # Define a vertical edge detection kernel
+    '''
+    kernel = torch.tensor([[1, 0, -1], 
+                        [2, 0, -2], 
+                        [1, 0, -1]], device=tensor_img.device).float().view(1, 1, 3, 3)
+    '''
+
+    # Apply padding to maintain dimensions
+    padded = funct.pad(((tensor_img - threshold) * sharpness).unsqueeze(0), (1, 1, 1, 1), mode='replicate')  # (1, 1, H+2, W+2)
+
+    # Compute the vertical gradient
+    grad_out = funct.conv2d(padded, sobel_kernel).squeeze(0)  # → (1, H, W)
+
+    # Apply sigmoid function to get the mask for vertical edges
+    mask = torch.sigmoid(grad_out)
+
+    # Secondly, perform soft erosion for contour detection.
+    # Soft Thresholding (Sigmoid instead of hard threshold)
+    binary = torch.sigmoid((tensor_img - threshold) * sharpness)  # ∈ (0,1)
+
+    # "Soft Erosion" via mean of the 3x3 neighborhood
+    kernel = torch.ones((1, 1, 3, 3), device=tensor_img.device) / 9.0
+
+    # Apply padding to maintain dimensions
+    padded = funct.pad(binary.unsqueeze(0), (1, 1, 1, 1), mode='replicate')  # (1, 1, H+2, W+2)
+
+    # Compute the mean of the 3x3 neighborhood
+    neighborhood_mean = funct.conv2d(padded, kernel).squeeze(0)  # → (1, H, W)
+
+    # Difference between center and neighborhood → contour measure
+    contour_strength = binary - neighborhood_mean
+
+    # Soft contour mask via Sigmoid (differentiable)
+    soft_contour = (torch.sigmoid(contour_strength * sharpness) - 0.5) * 2
+
+    # Clamp values to [0, 1]
+    soft_contour = soft_contour.clamp(0, 1)
+    return soft_contour * mask  # Values in [0,1], Shape: (1, H, W)
 
 def mse_by_pixel(
         image1: torch.Tensor,
@@ -114,6 +215,177 @@ def ssim_map(
                         (sigma1_sq + sigma2_sq + c2))
     ssim_map = ssim_nominator / ssim_denominator
     return ssim_map
+
+import torch
+import torch.nn.functional as F
+
+def chamfer_distance_batch_optimized(
+        batch1: torch.Tensor,
+        batch2: torch.Tensor,
+        downsample_factor: int = 4,
+        max_points: int = 1024,
+        use_mixed_precision: bool = True,
+        empty_image_value: float = 0.0,  # Value to assign for empty predictions
+        empty_threshold: float = 1e-6    # Threshold to consider an image empty
+) -> torch.Tensor:
+    """
+    Optimized Chamfer Distance calculation between two image batches, with handling for empty predictions.
+    
+    Parameters
+    -------
+    batch1 : torch.Tensor
+        First batch of image tensors, i.e. predicted images
+    batch2 : torch.Tensor
+        Second batch of image tensors, i.e. target images
+    downsample_factor : int
+        Factor by which to downsample the images
+    max_points : int
+        Maximum number of points to use per image
+    use_mixed_precision : bool
+        Whether to use mixed precision computation
+    empty_image_value : float
+        Value to return for empty prediction images (skips computation)
+    empty_threshold : float
+        Threshold below which a prediction image is considered empty
+        
+    Returns
+    -------
+    torch.Tensor
+        The Chamfer distance, with empty_image_value for empty predictions
+    """
+    assert batch1.shape == batch2.shape, "Input images must have the same shape."
+    B, H, W = batch1.shape
+    device = batch1.device
+    result_dtype = batch1.dtype
+    
+    # Set computation dtype
+    compute_dtype = torch.float16 if use_mixed_precision else result_dtype
+    
+    # Create a mask for non-empty predictions
+    max_values = batch1.reshape(B, -1).max(dim=1)[0]  # Get max value per image
+    non_empty_mask = max_values > empty_threshold     # Shape: (B,)
+    
+    # If all images are empty, return a batch of empty_image_value
+    if not torch.any(non_empty_mask):
+        return torch.full((B,), empty_image_value, device=device, dtype=result_dtype)
+    
+    # Prepare result tensor with default empty_image_value
+    chamfer_distances = torch.full((B,), empty_image_value, device=device, dtype=compute_dtype)
+    
+    # If no valid images, return early
+    if torch.sum(non_empty_mask) == 0:
+        return chamfer_distances.to(result_dtype)
+    
+    # Extract non-empty batches to process
+    batch1_valid = batch1[non_empty_mask]  # Shape: (valid_count, H, W)
+    batch2_valid = batch2[non_empty_mask]  # Shape: (valid_count, H, W)
+    valid_indices = torch.where(non_empty_mask)[0]
+    valid_count = valid_indices.shape[0]
+    
+    # Downsample images to reduce computation
+    if downsample_factor > 1:
+        H_ds = H // downsample_factor
+        W_ds = W // downsample_factor
+        batch1_ds = funct.interpolate(batch1_valid.unsqueeze(1), size=(H_ds, W_ds), mode='area').squeeze(1)
+        batch2_ds = funct.interpolate(batch2_valid.unsqueeze(1), size=(H_ds, W_ds), mode='area').squeeze(1)
+    else:
+        batch1_ds = batch1_valid
+        batch2_ds = batch2_valid
+        H_ds, W_ds = H, W
+    
+    # Convert to computation dtype
+    batch1_ds = batch1_ds.to(compute_dtype)
+    batch2_ds = batch2_ds.to(compute_dtype)
+    
+    # Use soft-thresholding
+    threshold = 0.1
+    image1_weights = torch.relu(batch1_ds - threshold)
+    image2_weights = torch.relu(batch2_ds - threshold)
+    
+    # Generate coordinate grids (only once)
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(H_ds, device=device, dtype=compute_dtype),
+        torch.arange(W_ds, device=device, dtype=compute_dtype),
+        indexing='ij'
+    )
+    # Scale coordinates to match original image dimensions
+    grid_y = grid_y.float() * downsample_factor
+    grid_x = grid_x.float() * downsample_factor
+    coords = torch.stack((grid_y, grid_x), dim=-1)  # Shape: (H_ds, W_ds, 2)
+    
+    # Process images in parallel where possible
+    image1_weights_flat = image1_weights.reshape(valid_count, H_ds * W_ds)  # Shape: (valid_count, H_ds*W_ds)
+    image2_weights_flat = image2_weights.reshape(valid_count, H_ds * W_ds)  # Shape: (valid_count, H_ds*W_ds)
+    coords_flat = coords.reshape(-1, 2)  # Shape: (H_ds*W_ds, 2)
+    
+    # Calculate Chamfer distances for each valid batch element
+    for i, b_idx in enumerate(valid_indices):
+        # Get weights for current batch item
+        img1_weights = image1_weights_flat[i]  # Shape: (H_ds*W_ds,)
+        img2_weights = image2_weights_flat[i]  # Shape: (H_ds*W_ds,)
+        
+        # Check for sufficient active pixels
+        active_pixels1 = (img1_weights > 0).sum().item()
+        active_pixels2 = (img2_weights > 0).sum().item()
+        
+        if active_pixels1 < 2 or active_pixels2 < 2:
+            # Skip this sample - leave default empty_image_value
+            continue
+        
+        # Sample a limited number of points to reduce computation
+        num_points1 = min(max_points, active_pixels1)
+        num_points2 = min(max_points, active_pixels2)
+        
+        # Sample the most important points
+        _, idx1 = torch.topk(img1_weights, num_points1)  # Shape: (num_points1,)
+        _, idx2 = torch.topk(img2_weights, num_points2)  # Shape: (num_points2,)
+        
+        # Get coordinates and weights for selected points
+        points1 = coords_flat[idx1]  # Shape: (num_points1, 2)
+        points2 = coords_flat[idx2]  # Shape: (num_points2, 2)
+        weights1 = img1_weights[idx1].unsqueeze(1)  # Shape: (num_points1, 1)
+        weights2 = img2_weights[idx2].unsqueeze(1)  # Shape: (num_points2, 1)
+        
+        try:
+            # Safely compute pairwise distances
+            max_weight1 = weights1.max()
+            max_weight2 = weights2.max()
+            
+            # Skip if the weights are too small
+            if max_weight1 <= 1e-8 or max_weight2 <= 1e-8:
+                continue
+                
+            # Normalize weights for numerical stability
+            norm_weights1 = weights1 / max_weight1
+            norm_weights2 = weights2 / max_weight2
+            
+            # Apply normalized weights
+            weighted_points1 = points1 * norm_weights1
+            weighted_points2 = points2 * norm_weights2
+            
+            # Compute pairwise distances
+            dists = torch.cdist(weighted_points1, weighted_points2, p=2)
+            
+            # Compute minimum distances in both directions
+            min_dists_1_to_2 = torch.min(dists, dim=1)[0]  # Shape: (num_points1,)
+            min_dists_2_to_1 = torch.min(dists, dim=0)[0]  # Shape: (num_points2,)
+            
+            # Clip to avoid extreme values
+            min_dists_1_to_2 = torch.clamp(min_dists_1_to_2, 0, 1e3)
+            min_dists_2_to_1 = torch.clamp(min_dists_2_to_1, 0, 1e3)
+            
+            # Compute Chamfer distance
+            chamfer_dist = (torch.mean(min_dists_1_to_2) + torch.mean(min_dists_2_to_1)) / 2
+            
+            # Ensure the distance is valid
+            if torch.isfinite(chamfer_dist):
+                chamfer_distances[b_idx] = chamfer_dist
+        except Exception:
+            # In case of any unexpected errors, skip this sample
+            continue
+    
+    # Return the distances tensor in original dtype
+    return chamfer_distances.to(result_dtype)
 
 def chamfer_distance_batch(
         batch1: torch.Tensor,

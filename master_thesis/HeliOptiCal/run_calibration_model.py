@@ -8,8 +8,8 @@ from datetime import datetime
 from pathlib import Path
 
 # Add local artist path for raytracing with multiple parallel heliostats.
-repo_path = os.path.abspath(os.path.dirname('/jump/tw/master_thesis/ARTIST-Fork-Tristan/artist'))
-sys.path.insert(0, repo_path) 
+artist_repo = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/artist'))
+sys.path.insert(0, artist_repo)  
 from artist.util.scenario import Scenario
 from calibration_model import CalibrationModel
 
@@ -22,7 +22,7 @@ if __name__ == '__main__':
     actual reflection direction obtained from the calibration data.
     """
     
-    config_file = '/jump/tw/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/run_config.json'
+    config_file = '/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/run_config.json'
     run_config = json.load(open(config_file))
 
     # Set device.
