@@ -42,12 +42,12 @@ class LinearActuators(Actuators):
 
     def __init__(
         self,
-        clockwise_axis_movements: torch.Tensor,
-        increments: torch.Tensor,
-        initial_stroke_lengths: torch.Tensor,
-        offsets: torch.Tensor,
-        pivot_radii: torch.Tensor,
-        initial_angles: torch.Tensor,
+        clockwise_axis_movements: torch.nn.ParameterList,
+        increments: torch.nn.ParameterList,
+        initial_stroke_lengths: torch.nn.ParameterList,
+        offsets: torch.nn.ParameterList,
+        pivot_radii: torch.nn.ParameterList,
+        initial_angles: torch.nn.ParameterList,
     ) -> None:
         """
         Initialize linear actuators.
@@ -85,6 +85,26 @@ class LinearActuators(Actuators):
         self.pivot_radii = pivot_radii
         self.initial_angles = initial_angles
 
+    def _get_stacked_parameters(self, device: Union[torch.device, str] = "cuda"):
+        """
+        Get all actuator parameters as stacked tensors.
+        The stacked tensors maintain references to the original parameters.
+        
+        Returns:
+        --------
+        dict
+            Dictionary with parameter names and stacked tensors
+        """
+        # Stack parameters while maintaining the references
+        clockwise_axis_movements = torch.stack([torch.stack([param for param in hel]) for hel in self.clockwise_axis_movements]).to(device)
+        increments = torch.stack([torch.stack([param for param in hel]) for hel in self.increments]).to(device)
+        initial_stroke_lengths = torch.stack([torch.stack([param for param in hel]) for hel in self.initial_stroke_lengths]).to(device)
+        offsets = torch.stack([torch.stack([param for param in hel]) for hel in self.offsets]).to(device)
+        pivot_radii = torch.stack([torch.stack([param for param in hel]) for hel in self.pivot_radii]).to(device)
+        initial_angles = torch.stack([torch.stack([param for param in hel]) for hel in self.initial_angles]).to(device)
+        
+        return clockwise_axis_movements, increments, initial_stroke_lengths, offsets, pivot_radii, initial_angles
+    
     def _motor_positions_to_absolute_angles(
         self, motor_positions: torch.Tensor
     ) -> torch.Tensor:
@@ -105,9 +125,12 @@ class LinearActuators(Actuators):
         torch.Tensor
             The calculated absolute angles.
         """
-        stroke_lengths = motor_positions / self.increments + self.initial_stroke_lengths
-        calc_step_1 = self.offsets**2 + self.pivot_radii**2 - stroke_lengths**2
-        calc_step_2 = 2.0 * self.offsets * self.pivot_radii
+        device = motor_positions.device
+        _, increments, initial_stroke_lengths, offsets, pivot_radii, _ = self._get_stacked_parameters(device=device)
+        
+        stroke_lengths = motor_positions / increments + initial_stroke_lengths
+        calc_step_1 = offsets**2 + pivot_radii**2 - stroke_lengths**2
+        calc_step_2 = 2.0 * offsets * pivot_radii
         calc_step_3 = calc_step_1 / calc_step_2
         absolute_angles = torch.arccos(calc_step_3)
         return absolute_angles
@@ -142,8 +165,9 @@ class LinearActuators(Actuators):
         )
         delta_angles = absolute_initial_angles - absolute_angles
 
+        clockwise_axis_movements, _, _, _, _, initial_angles = self._get_stacked_parameters(device=device)
         relative_angles = (
-            self.initial_angles + delta_angles * (self.clockwise_axis_movements == 1) - delta_angles * (self.clockwise_axis_movements == 0)
+            initial_angles + delta_angles * (clockwise_axis_movements == 1) - delta_angles * (clockwise_axis_movements == 0)
         )
         return relative_angles
 
@@ -170,10 +194,13 @@ class LinearActuators(Actuators):
             The motor steps.
         """
         device = torch.device(device)
+        
+        clockwise_axis_movements, increments, initial_stroke_lengths, offsets, pivot_radii, initial_angles = self._get_stacked_parameters(device=device)
+        
         delta_angles = torch.where(
-            self.clockwise_axis_movements == 1, 
-            angles - self.initial_angles,
-            self.initial_angles - angles
+            clockwise_axis_movements == 1, 
+            angles - initial_angles,
+            initial_angles - angles
         )
 
         absolute_initial_angles = self._motor_positions_to_absolute_angles(
@@ -182,10 +209,10 @@ class LinearActuators(Actuators):
         initial_angles = absolute_initial_angles - delta_angles
 
         calc_step_3 = torch.cos(initial_angles)
-        calc_step_2 = 2.0 * self.offsets * self.pivot_radii
+        calc_step_2 = 2.0 * offsets * pivot_radii
         calc_step_1 = calc_step_3 * calc_step_2
-        stroke_lengths = torch.sqrt(self.offsets**2 + self.pivot_radii**2 - calc_step_1)
-        motor_positions = (stroke_lengths - self.initial_stroke_lengths) * self.increments
+        stroke_lengths = torch.sqrt(offsets**2 + pivot_radii**2 - calc_step_1)
+        motor_positions = (stroke_lengths - initial_stroke_lengths) * increments
         return motor_positions
 
     def forward(self) -> None:
