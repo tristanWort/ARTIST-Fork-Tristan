@@ -62,18 +62,18 @@ class LinearActuators(Actuators):
 
         Parameters
         ----------
-        clockwise_axis_movements : bool
+        clockwise_axis_movements : torch.Tensor
             Turning directions of the joints.
-        increments : torch.Tensor
+        increments : torch.nn.ParameterList
             The stroke length changes per motor step.
-        initial_stroke_lengths : torch.Tensor
+        initial_stroke_lengths : torch.nn.ParameterList
             The stroke lengths for a motor step of 0.
-        offsets : torch.Tensor
+        offsets : torch.nn.ParameterList
             The offsets between the linear actuators' pivoting points and the points
             around which the actuators are allowed to pivot.
-        pivot_radii : torch.Tensor
+        pivot_radii : torch.nn.ParameterList
             The actuators' pivoting radii.
-        initial_angle : torch.Tensor
+        initial_angle : torch.nn.ParameterList
             The angles that the actuators introduce to the manipulated coordinate systems
             at the initial stroke lengths.
         """
