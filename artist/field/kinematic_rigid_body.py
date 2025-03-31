@@ -224,22 +224,6 @@ class RigidBody(Kinematic):
         )
         
         return all_actuators_params, all_actuators
-
-    def _get_stacked_heliostat_positions(self, device: Union[torch.device, str] = "cuda") -> torch.Tensor:
-        heliostat_positions = torch.stack(
-            [torch.stack([position for position in self.heliostat_positions[heliostat]])
-            for heliostat in range(self.number_of_heliostats)]
-            ).to(device)
-        
-        return heliostat_positions
-    
-    def _get_stacked_deviation_parameters(self, device: Union[torch.device, str] = "cuda") -> torch.Tensor:
-        deviation_parameters = torch.stack(
-            [torch.stack([deviation_param for deviation_param in self.deviation_parameters[heliostat]])
-             for heliostat in range(self.number_of_heliostats)]
-            ).to(device)
-        
-        return deviation_parameters
         
     def incident_ray_direction_to_orientation(
         self,
