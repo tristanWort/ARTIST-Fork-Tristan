@@ -96,12 +96,29 @@ class LinearActuators(Actuators):
             Dictionary with parameter names and stacked tensors
         """
         # Stack parameters while maintaining the references
-        clockwise_axis_movements = torch.stack([torch.stack([param for param in hel]) for hel in self.clockwise_axis_movements]).to(device)
-        increments = torch.stack([torch.stack([param for param in hel]) for hel in self.increments]).to(device)
-        initial_stroke_lengths = torch.stack([torch.stack([param for param in hel]) for hel in self.initial_stroke_lengths]).to(device)
-        offsets = torch.stack([torch.stack([param for param in hel]) for hel in self.offsets]).to(device)
-        pivot_radii = torch.stack([torch.stack([param for param in hel]) for hel in self.pivot_radii]).to(device)
-        initial_angles = torch.stack([torch.stack([param for param in hel]) for hel in self.initial_angles]).to(device)
+        clockwise_axis_movements = torch.stack(
+            [torch.stack([param for param in hel]) for hel in self.clockwise_axis_movements]
+            ).to(device)
+        
+        increments = torch.stack(
+            [torch.stack([param for param in hel]) for hel in self.increments]
+            ).to(device)
+        
+        initial_stroke_lengths = torch.stack(
+            [torch.stack([param for param in hel]) for hel in self.initial_stroke_lengths]
+            ).to(device)
+        
+        offsets = torch.stack(
+            [torch.stack([param for param in hel]) for hel in self.offsets]
+            ).to(device)
+        
+        pivot_radii = torch.stack(
+            [torch.stack([param for param in hel]) for hel in self.pivot_radii]
+            ).to(device)
+        
+        initial_angles = torch.stack(
+            [torch.stack([param for param in hel]) for hel in self.initial_angles]
+            ).to(device)
         
         return clockwise_axis_movements, increments, initial_stroke_lengths, offsets, pivot_radii, initial_angles
     
