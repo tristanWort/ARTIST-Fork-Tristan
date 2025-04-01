@@ -20,21 +20,67 @@ def get_rigid_body_kinematic_parameters_from_scenario(
     dict[str, torch.Tensor]
         The parameters from the kinematic (requires_grad is True).
     """    
-    parameters_dict = {
-        "all_heliostat_positions_enu_4d": kinematic.heliostat_positions,
-        "all_kinematic_deviation_parameters": kinematic.deviation_parameters,
-        "actuators_increments": kinematic.actuators.increments,
-        "actuators_initial_stroke_lengths": kinematic.actuators.initial_stroke_lengths,
-        "actuators_offsets": kinematic.actuators.offsets,
-        "actuators_pivot_radii": kinematic.actuators.pivot_radii,
-        "actuators_initial_angles": kinematic.actuators.initial_angles,
-    }
+    parameters_dict = torch.nn.ParameterDict()
+    parameters_dict.update(kinematic.all_heliostats_position_params)
+    parameters_dict.update(kinematic.all_deviations_params)
+    parameters_dict.update(kinematic.all_actuators_params)
     
-    for parameter in parameters_dict.values():
-        if parameter is not None:
-            parameter.requires_grad_()
-
     return parameters_dict
+
+
+def check_for_nan_grad(obj, name=None, index=None):
+    """
+    Recursively check for nan-gradients in Pytorch containers.
+    Works with nn.ParameterDict, nn.ParameterList, nn.Parameter, etc.
+    
+    """
+    if isinstance(obj, torch.nn.Parameter):
+        if obj.grad is not None and torch.isnan(obj.grad).any():
+            print(f"Paramter has nan-gradient: {name}, {index}")
+            
+    elif isinstance(obj, (torch.nn.ParameterDict, dict)):
+        for name, param in obj.items():
+            check_for_nan_grad(param, name=name, index=index)
+                          
+    elif isinstance(obj, (torch.nn.ParameterList, list, tuple)):
+        for index, param in enumerate(obj):
+            check_for_nan_grad(param, name=name, index=index)
+
+
+def count_parameters(obj):
+    """
+    Recursively count parameters in PyTorch containers.
+    Works with nn.ParameterDict, nn.ParameterList, nn.Parameter, etc.
+    
+    Returns:
+        tuple: (num_params, num_elements) where
+               num_params is the number of Parameter objects
+               num_elements is the total number of values in all parameters
+    """
+    if isinstance(obj, torch.nn.Parameter):
+        return 1, obj.numel()
+    
+    elif isinstance(obj, (torch.nn.ParameterDict, torch.nn.ParameterList, 
+                          dict, list, tuple)):
+        # Get collection of items to iterate
+        if isinstance(obj, (torch.nn.ParameterDict, dict)):
+            items = obj.values()
+        else:  # ParameterList, list, or tuple
+            items = obj
+            
+        # Sum up parameters in all items
+        params_count = 0
+        elements_count = 0
+        for item in items:
+            p, e = count_parameters(item)
+            params_count += p
+            elements_count += e
+            
+        return params_count, elements_count
+    
+    # Not a parameter or container
+    return 0, 0
+
 
 # def get_rigid_body_kinematic_parameters_from_scenario(
 #     kinematic: RigidBody,
