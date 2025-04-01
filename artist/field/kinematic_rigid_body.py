@@ -189,38 +189,38 @@ class RigidBody(Kinematic):
             raise NotImplementedError("Actuator type not implemented!")
 
         all_actuators_params = torch.nn.ParameterDict({
-            'increments': torch.nn.ParameterList(),
-            'initial_stroke_lengths': torch.nn.ParameterList(),
-            'offsets': torch.nn.ParameterList(),
-            'pivot_radii': torch.nn.ParameterList(),
-            'initial_angles': torch.nn.ParameterList(),
+            'actuators_increments': torch.nn.ParameterList(),
+            'actuators_initial_stroke_lengths': torch.nn.ParameterList(),
+            'actuators_offsets': torch.nn.ParameterList(),
+            'actuators_pivot_radii': torch.nn.ParameterList(),
+            'actuators_initial_angles': torch.nn.ParameterList(),
         })
         
         for heliostat_actuators in all_actuator_parameters:
-            all_actuators_params['increments'].append(torch.nn.ParameterList(
+            all_actuators_params['actuators_increments'].append(torch.nn.ParameterList(
                 [torch.nn.Parameter(actuator_increment).to(device) for actuator_increment in heliostat_actuators[2]]
                 ))
-            all_actuators_params['initial_stroke_lengths'].append(torch.nn.ParameterList(
+            all_actuators_params['actuators_initial_stroke_lengths'].append(torch.nn.ParameterList(
                 [torch.nn.Parameter(actuator_increment).to(device) for actuator_increment in heliostat_actuators[3]]
                 ))
-            all_actuators_params['offsets'].append(torch.nn.ParameterList(
+            all_actuators_params['actuators_offsets'].append(torch.nn.ParameterList(
                 [torch.nn.Parameter(actuator_increment).to(device) for actuator_increment in heliostat_actuators[4]]
                 ))
-            all_actuators_params['pivot_radii'].append(torch.nn.ParameterList(
+            all_actuators_params['actuators_pivot_radii'].append(torch.nn.ParameterList(
                 [torch.nn.Parameter(actuator_increment).to(device) for actuator_increment in heliostat_actuators[5]]
                 ))
-            all_actuators_params['initial_angles'].append(torch.nn.ParameterList(
+            all_actuators_params['actuators_initial_angles'].append(torch.nn.ParameterList(
                 [torch.nn.Parameter(actuator_increment).to(device) for actuator_increment in heliostat_actuators[6]]
                 ))
         
         # Create one Linear Actuators instance for all heliostats and all actuators.
         all_actuators = LinearActuators(
             clockwise_axis_movements=all_actuator_parameters[:, 1],
-            increments=all_actuators_params['increments'],
-            initial_stroke_lengths=all_actuators_params['initial_stroke_lengths'],
-            offsets=all_actuators_params['offsets'],
-            pivot_radii=all_actuators_params['pivot_radii'],
-        	initial_angles=all_actuators_params['initial_angles'],
+            increments=all_actuators_params['actuators_increments'],
+            initial_stroke_lengths=all_actuators_params['actuators_initial_stroke_lengths'],
+            offsets=all_actuators_params['actuators_offsets'],
+            pivot_radii=all_actuators_params['actuators_pivot_radii'],
+        	initial_angles=all_actuators_params['actuators_initial_angles'],
         )
         
         return all_actuators_params, all_actuators
