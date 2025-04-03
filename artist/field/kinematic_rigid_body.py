@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Tuple
 
 from artist.field.actuator_linear import LinearActuators
 import torch
@@ -23,6 +23,10 @@ class RigidBody(Kinematic):
         The aim points of the heliostats.
     initial_orientations : torch.Tensor
         The initial orientation offsets of the heliostats.
+    orientations : torch.Tensor
+        The present orienations of the heliostats.
+    motor_positions : torch.Tensor
+        The present motor positions of the heliostats.
     deviation_parameters : torch.Tensor
         The deviation parameters for the kinematic.
     artist_standard_orientation : torch.Tensor
@@ -114,9 +118,29 @@ class RigidBody(Kinematic):
         all_heliostat_positions: torch.Tensor,
         all_deviations: torch.Tensor,
         device: Union[torch.device, str] = "cuda",
-    ) -> (torch.nn.ParameterDict, torch.nn.ParameterDict):
-        device = torch.device(device)
+    ) -> Tuple[torch.nn.ParameterDict, torch.nn.ParameterDict]:
+        """
+        Process the given parameters so that these are stored as torch.nn.Parameters.
         
+        For each parameter group (positions and deviations) a torch.nn.ParameterDict
+        is created.
+        
+        Parameters
+        ----------
+        all_heliostat_positions : torch.Tensor
+            The positions of the heliostats.
+        all_deviations : torch.Tensor
+            The deviation parameters of all heliostats.
+        device : Union[torch.device, str]
+            The device on which to initialize tensors (default is cuda). 
+                        
+        Returns
+        -------
+        Tuple[torch.nn.ParameterDict, torch.nn.ParameterDict]
+            Both ParamterDicts for the heliostat positions and the deviation parameters.
+        """
+        device = torch.device(device)
+
         assert all_heliostat_positions.shape[0] == self.number_of_heliostats, (
             "First shape in heliostat_positions does not match the number of heliostats.")
         assert all_deviations.shape[0] == self.number_of_heliostats, (
@@ -176,12 +200,29 @@ class RigidBody(Kinematic):
         
         return all_heliostats_position_params, all_deviations_params
         
-    
     def _config_actuators(
         self, 
         all_actuator_parameters: torch.Tensor,
         device: Union[torch.device, str] = "cuda",
-        ) -> (torch.nn.ParameterDict, LinearActuators):
+        ) -> Tuple[torch.nn.ParameterDict, LinearActuators]:
+        """
+        Process the actuator parameters so that these are stored as torch.nn.Parameters.
+        The parameters are processed to a torch.nn.ParamterDict.
+        
+        Also, use parameters to generate actuators instance.
+        
+        Parameters
+        ----------
+        all_actuator_parameters : torch.Tensor
+            The actuator parameters of the heliostats.
+        device : Union[torch.device, str]
+            The device on which to initialize tensors (default is cuda). 
+                        
+        Returns
+        -------
+        Tuple[torch.nn.ParameterDict, LinearActuators]
+            Tuple of the actuators ParameterDict and the LinearActuators instance.
+        """  
         device = torch.device(device)
         
         assert all_actuator_parameters.shape[0] == self.number_of_heliostats, (
