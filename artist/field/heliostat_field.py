@@ -276,6 +276,7 @@ class HeliostatField(torch.nn.Module):
     def align_surfaces_with_incident_ray_direction(
         self,
         incident_ray_direction: torch.Tensor,
+        round_motor_pos: bool = False,
         device: Union[torch.device, str] = "cuda",
     ) -> None:
         """
@@ -287,24 +288,21 @@ class HeliostatField(torch.nn.Module):
         ----------
         incident_ray_direction : torch.Tensor
             The incident ray direction.
+        round_motor_pos : boool
+            Whether the approximated motor positions should be rounded to itegers (defautlt is False)
         device : Union[torch.device, str]
             The device on which to initialize tensors (default is cuda).
         """
-        # rigid_body_kinematic = RigidBody(
-        #     number_of_heliostats=self.number_of_heliostats,
-        #     heliostat_positions=self.all_heliostat_positions,
-        #     aim_points=self.all_aim_points,
-        #     actuator_parameters=self.all_actuator_parameters,
-        #     initial_orientations=self.all_initial_orientations,
-        #     deviation_parameters=self.all_kinematic_deviation_parameters,
-        #     device=device
-        # )
         device = torch.device(device)
         (
             self.all_current_aligned_surface_points,
             self.all_current_aligned_surface_normals,
         ) = self.rigid_body_kinematic.align_surfaces_with_incident_ray_direction(
-            incident_ray_direction, self.all_surface_points, self.all_surface_normals, device
+            incident_ray_direction, 
+            self.all_surface_points, 
+            self.all_surface_normals, 
+            round_motor_pos,
+            device
         )
         self.all_aligned_heliostats = torch.ones_like(self.all_aligned_heliostats)
 

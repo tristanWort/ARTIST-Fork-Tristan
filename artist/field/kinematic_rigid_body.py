@@ -92,6 +92,8 @@ class RigidBody(Kinematic):
         self.initial_orientations = initial_orientations
         self.orientations = initial_orientations
         
+        self.motor_positions = torch.zeros((number_of_heliostats, config_dictionary.rigid_body_number_of_actuators), device=device)
+        
         self.all_heliostats_position_params, self.all_deviations_params = self._process_parameters(
             all_heliostat_positions=heliostat_positions,
             all_deviations=deviation_parameters,
@@ -228,6 +230,7 @@ class RigidBody(Kinematic):
     def incident_ray_direction_to_orientation(
         self,
         incident_ray_direction: torch.Tensor,
+        round_motor_pos: bool = False,  # TODO: Check if this destroys the computational graph.
         max_num_iterations: int = 2,
         min_eps: float = 0.0001,
         device: Union[torch.device, str] = "cuda",
@@ -253,7 +256,7 @@ class RigidBody(Kinematic):
         """
         device = torch.device(device)
         
-        motor_positions = torch.zeros((self.number_of_heliostats, config_dictionary.rigid_body_number_of_actuators), device=device)
+        motor_positions = self.motor_positions
         last_iteration_loss = None
         
         for _ in range(max_num_iterations):
@@ -390,12 +393,19 @@ class RigidBody(Kinematic):
             motor_positions = self.actuators.angles_to_motor_positions(
                 joint_angles, device
             )
+            
+            if round_motor_pos:
+                motor_positions = motor_positions.round()
 
         east_angles, north_angles, up_angles = utils.decompose_rotations(
             initial_vector=self.initial_orientations[:, :-1],
             target_vector=self.artist_standard_orientation[:-1],
             device=device,
         )
+        
+        # Save final motor positions
+        self.motor_positions = motor_positions
+        
         # Return orientation matrices multiplied by the initial orientation offsets.
         return (
             orientations
@@ -418,6 +428,7 @@ class RigidBody(Kinematic):
         incident_ray_direction: torch.Tensor,
         surface_points: torch.Tensor,
         surface_normals: torch.Tensor,
+        round_motor_pos: bool = False,
         device: Union[torch.device, str] = "cuda",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -445,7 +456,9 @@ class RigidBody(Kinematic):
 
         orientations = self.incident_ray_direction_to_orientation(
             incident_ray_direction,
-            max_num_iterations=10, device=device
+            max_num_iterations=10, 
+            round_motor_pos=round_motor_pos, 
+            device=device
         )
         self.orientations = orientations
 
@@ -498,21 +511,22 @@ class RigidBody(Kinematic):
         joint_rotations = torch.zeros((self.number_of_heliostats, config_dictionary.rigid_body_number_of_actuators, 4, 4), device=device) 
 
         joint_rotations[:, 0] = (
-                utils.rotate_n(
-                    n=torch.stack([p for p in self.all_deviations_params['first_joint_tilt_n']]).to(device), device=device
-                )
-                @ utils.rotate_u(
-                    u=torch.stack([p for p in self.all_deviations_params['first_joint_tilt_u']]).to(device), device=device
-                )
-                @ utils.translate_enu(  
-                    e=torch.stack([p for p in self.all_deviations_params['first_joint_translation_e']]).to(device),
-                    n=torch.stack([p for p in self.all_deviations_params['first_joint_translation_n']]).to(device),
-                    u=torch.stack([p for p in self.all_deviations_params['first_joint_translation_u']]).to(device),
-                    device=device,
-                )
-                @ utils.rotate_e(
-                    e=joint_angles[:, 0], device=device)  # first_joint_angle
+            utils.rotate_n(
+                n=torch.stack([p for p in self.all_deviations_params['first_joint_tilt_n']]).to(device), device=device
             )
+            @ utils.rotate_u(
+                u=torch.stack([p for p in self.all_deviations_params['first_joint_tilt_u']]).to(device), device=device
+            )
+            @ utils.translate_enu(
+                e=torch.stack([p for p in self.all_deviations_params['first_joint_translation_e']]).to(device),
+                n=torch.stack([p for p in self.all_deviations_params['first_joint_translation_n']]).to(device),
+                u=torch.stack([p for p in self.all_deviations_params['first_joint_translation_u']]).to(device),
+                device=device,)
+            
+            @ utils.rotate_e(
+                e=joint_angles[:, 0], device=device)
+        )
+        
         joint_rotations[:, 1] = (
             utils.rotate_e(
                 e=torch.stack([p for p in self.all_deviations_params['second_joint_tilt_e']]).to(device), device=device
@@ -532,7 +546,7 @@ class RigidBody(Kinematic):
 
         orientations = (
             initial_orientations
-            @ joint_rotations[:, 0]  
+            @ joint_rotations[:, 0]
             @ joint_rotations[:, 1]
             @ utils.translate_enu(
                 e=torch.stack([p for p in self.all_deviations_params['concentrator_translation_e']]).to(device),
@@ -560,30 +574,7 @@ class RigidBody(Kinematic):
             device=device,
         )
 
-        # Return orientation matrix multiplied by the initial orientation offset.
-        return (
-            orientations
-            @ utils.rotate_e(
-                e=east_angles,
-                device=device,
-            )
-            @ utils.rotate_n(
-                n=north_angles,
-                device=device,
-            )
-            @ utils.rotate_u(
-                u=up_angles,
-                device=device,
-            )
-        )
-
-        east_angles, north_angles, up_angles = utils.decompose_rotations(
-            initial_vector=self.initial_orientations[:, :-1],
-            target_vector=self.artist_standard_orientation[:-1],
-            device=device,
-        )
-
-        # Return orientation matrix multiplied by the initial orientation offset.
+        # Return orientation matrices multiplied by the initial orientation offsets.
         return (
             orientations
             @ utils.rotate_e(
