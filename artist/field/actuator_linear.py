@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Tuple
 
 import torch
 
@@ -78,6 +78,7 @@ class LinearActuators(Actuators):
             at the initial stroke lengths.
         """
         super().__init__()
+        # Todo clock
         self.clockwise_axis_movements = clockwise_axis_movements
         self.increments = increments
         self.initial_stroke_lengths = initial_stroke_lengths
@@ -85,15 +86,20 @@ class LinearActuators(Actuators):
         self.pivot_radii = pivot_radii
         self.initial_angles = initial_angles
 
-    def _get_stacked_parameters(self, device: Union[torch.device, str] = "cuda"):
+    def _get_stacked_parameters(
+        self, 
+        device: Union[torch.device, str] = "cuda"
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
+                   torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get all actuator parameters as stacked tensors.
         The stacked tensors maintain references to the original parameters.
         
         Returns:
         --------
-        dict
-            Dictionary with parameter names and stacked tensors
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
+              torch.Tensor, torch.Tensor, torch.Tensor]
+            Tuple of stacked parameters.
         """
         # Stack parameters while maintaining the references
         clockwise_axis_movements = torch.stack(
@@ -186,7 +192,7 @@ class LinearActuators(Actuators):
         relative_angles = (
             initial_angles + delta_angles * (clockwise_axis_movements == 1) - delta_angles * (clockwise_axis_movements == 0)
         )
-        return relative_angles
+        return relative_angles.squeeze(0)
 
     def angles_to_motor_positions(
         self, angles: torch.Tensor, device: Union[torch.device, str] = "cuda"
