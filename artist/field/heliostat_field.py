@@ -289,7 +289,7 @@ class HeliostatField(torch.nn.Module):
         incident_ray_direction : torch.Tensor
             The incident ray direction.
         round_motor_pos : boool
-            Whether the approximated motor positions should be rounded to itegers (defautlt is False)
+            Whether the approximated motor positions should be rounded (default is False).
         device : Union[torch.device, str]
             The device on which to initialize tensors (default is cuda).
         """

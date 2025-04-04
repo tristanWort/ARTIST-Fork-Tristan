@@ -283,6 +283,8 @@ class RigidBody(Kinematic):
         ----------
         incident_ray_direction : torch.Tensor
             The direction of the incident ray as seen from the heliostat.
+        round_motor_pos : boool
+            Whether the approximated motor positions should be rounded (default is False).
         max_num_iterations : int
             Maximum number of iterations (default: 2).
         min_eps : float
@@ -483,6 +485,8 @@ class RigidBody(Kinematic):
             Points on the surface of the heliostats that reflect the light.
         surface_normals : torch.Tensor
             Normals to the surface points.
+        round_motor_pos : boool
+            Whether the approximated motor positions should be rounded (default is False).
         device : Union[torch.device, str]
             The device on which to initialize tensors (default is cuda).
 
