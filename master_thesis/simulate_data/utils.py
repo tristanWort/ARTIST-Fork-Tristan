@@ -12,6 +12,54 @@ sys.path.insert(0, repo_path)
 from artist.raytracing.heliostat_tracing import HeliostatRayTracer
 
 
+def align_and_raytrace(scenario,
+                       incident_ray_directions: torch.tensor,
+                       target_areas: list(),
+                       aim_points=None,
+                       align_with_motor_positions=False,
+                       motor_positions=None,
+                       seed=42,
+                       device='cuda'):
+        """
+        Perform aiming and raytracing for the heliostat field for the given scenario.
+        
+        For alignment there are two options.
+            1) Align with incident ray directions and aim points.
+            2) Align with motor positions.
+        """
+        # Auxiliary referencing to kinematic
+        kinematic = scenario.heliostat_field.rigid_body_kinematic
+        
+        if not align_with_motor_positions:
+            # Set aim points and then align with incident ray directions
+            kinematic.aim_points = aim_points
+            # Align with incident ray directions
+            scenario.heliostat_field.align_surfaces_with_incident_ray_direction(
+                incident_ray_direction=incident_ray_directions,
+                round_motor_pos=True,
+                device=device
+                )
+        
+        else:
+            # Align with motor positions
+            scenario.heliostat_field.align_surfaces_with_motor_positions(
+               motor_positions=motor_positions,
+               device=device
+               )
+        
+        # Initiate Raytracer
+        raytracer = HeliostatRayTracer(scenario=scenario, 
+                                       world_size=1, 
+                                       rank=0, 
+                                       batch_size=1, 
+                                       random_seed=seed) 
+        # Raytrace and store bitmaps
+        final_bitmaps = raytracer.trace_rays_separate(incident_ray_directions=incident_ray_directions,
+                                                      target_areas=target_areas,
+                                                      device=device)
+        return final_bitmaps
+
+
 def aim_and_shoot_and_save_bitmaps(scenario,
                                    name: str,
                                    incident_ray_directions: torch.tensor,

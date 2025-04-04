@@ -172,9 +172,9 @@ def add_random_errors_to_kinematic(kinematic: RigidBody, save_dir: str, heliosta
             'first_joint_translation_e': 0.05,
             'first_joint_translation_n': 0.05,
             'first_joint_translation_u': 0.01,
-            'second_joint_translation_e': 0.0,
-            'second_joint_translation_n': 0.0,
-            'second_joint_translation_u': 0.0,
+            'second_joint_translation_e': 0.01,
+            'second_joint_translation_n': 0.01,
+            'second_joint_translation_u': 0.005,
             'concentrator_translation_e': 0.0,
             'concentrator_translation_n': 0.0,
             'concentrator_translation_u': 0.0,
@@ -191,7 +191,7 @@ def add_random_errors_to_kinematic(kinematic: RigidBody, save_dir: str, heliosta
         'all_actuators_params': {
             'actuators_increments': 300,  # steps / m
             'actuators_initial_stroke_lengths': 0.01,
-            'actuators_offsets': 0.005,
+            'actuators_offsets': 0.01,
             'actuators_pivot_radii': 0.001,
             'actuators_initial_angles': 0.003,  # radians
         }
