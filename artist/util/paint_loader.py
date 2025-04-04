@@ -1,6 +1,6 @@
 import json
 import pathlib
-from typing import Union
+from typing import Union, Literal
 
 import torch
 
@@ -28,6 +28,8 @@ from artist.util.surface_converter import SurfaceConverter
 def extract_paint_calibration_data(
     calibration_properties_path: pathlib.Path,
     power_plant_position: torch.Tensor,
+    coord_system: Literal['wgs84', 'local_enu'] = 'wgs84',
+    has_surface_normal : bool = False,
     device: Union[torch.device, str] = "cuda",
 ) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -59,20 +61,27 @@ def extract_paint_calibration_data(
         calibration_target_name = calibration_dict[
             config_dictionary.paint_calibration_traget
         ]
-        center_calibration_image = utils.convert_wgs84_coordinates_to_local_enu(
-            torch.tensor(
-                calibration_dict[config_dictionary.paint_focal_spot][
-                    config_dictionary.paint_utis
-                ],
-                dtype=torch.float64,
+        if coord_system == 'wgs84':
+            center_calibration_image = utils.convert_wgs84_coordinates_to_local_enu(
+                torch.tensor(
+                    calibration_dict[config_dictionary.paint_focal_spot][
+                        config_dictionary.paint_utis
+                    ],
+                    dtype=torch.float64,
+                    device=device,
+                ),
+                power_plant_position,
                 device=device,
-            ),
-            power_plant_position,
-            device=device,
-        )
-        center_calibration_image = utils.convert_3d_point_to_4d_format(
-            center_calibration_image, device=device
-        )
+            )
+            center_calibration_image = utils.convert_3d_point_to_4d_format(
+                center_calibration_image, device=device
+            )
+                 
+        elif coord_system == 'local_enu':
+            center_calibration_image = torch.tensor(
+                calibration_dict['focal_spot_enu'], dtype=torch.float32, device=device
+                )
+            
         sun_azimuth = torch.tensor(
             calibration_dict[config_dictionary.paint_sun_azimuth], device=device
         )
@@ -94,12 +103,26 @@ def extract_paint_calibration_data(
             ],
             device=device,
         )
+        
+        if has_surface_normal: # in enu
+            surface_normal = torch.tensor(
+                calibration_dict['surface_normal'], dtype=torch.float32, device=device
+                )
+            
+            return (
+                calibration_target_name,
+                center_calibration_image,
+                sun_position_enu,
+                motor_positions,
+                surface_normal
+            )
 
     return (
         calibration_target_name,
         center_calibration_image,
         sun_position_enu,
         motor_positions,
+        torch.tensor([], device=device)
     )
 
 
