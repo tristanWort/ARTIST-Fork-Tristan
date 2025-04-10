@@ -49,7 +49,7 @@ class CalibrationDataLoader:
             heliostats_to_load: List[str],
             power_plant_position: torch.Tensor,
             load_flux_images: bool = True,
-            has_surface_normal: bool = False,
+            ideal_flux_center: bool = False,
             properties_file_ends_with: Optional[str] = '-properties.json',
             flux_file_ends_with: Optional[str] = '-flux.png',
             device: Union[torch.device, str] = "cuda"
@@ -78,13 +78,13 @@ class CalibrationDataLoader:
         self.incident_rays: Dict[str, torch.Tensor] = {}  # shape [4,]
         self.receiver_targets: Dict[str, str] = {}
         self.flux_images: Dict[str, torch.Tensor] = {}  # shape [256, 256]
-        self.surface_normals: Dict[str, torch.Tensor] = {}
+        self.ideal_flux_centers: Dict[str, torch.Tensor] = {}
         
         # Whether to load flux images
         self.load_flux_images = load_flux_images
         
-        # Whether properties files contain surface normals
-        self.has_surface_normal = has_surface_normal
+        # Whether properties files contain ideal flux centers
+        self.has_ideal_flux_center = ideal_flux_center
         
         # File endings for calibration properties and flux images
         self.properties_file_ends_with = properties_file_ends_with
@@ -130,19 +130,34 @@ class CalibrationDataLoader:
                     calibration_data = json.load(file)
                 
                 try:
-                    (
-                        calibration_target_name,
-                        spot_center,
-                        sun_position,
-                        motor_positions,
-                        surface_normal
-                    ) = extract_paint_calibration_data(
-                        calibration_properties_path=Path(properties_file),
-                        power_plant_position=self.power_plant_position,
-                        coord_system='local_enu',
-                        has_surface_normal=self.has_surface_normal,
-                        device=self.device
-                    )
+                    if self.has_ideal_flux_center:
+                        (
+                            calibration_target_name,
+                            spot_center,
+                            sun_position,
+                            motor_positions,
+                            ideal_flux_center
+                        ) = extract_paint_calibration_data(
+                            calibration_properties_path=Path(properties_file),
+                            power_plant_position=self.power_plant_position,
+                            coord_system='local_enu',
+                            has_ideal_flux_center=True,
+                            device=self.device
+                        )
+                        self.ideal_flux_centers[calibration_id] = ideal_flux_center
+                    else:
+                        (
+                            calibration_target_name,
+                            spot_center,
+                            sun_position,
+                            motor_positions,
+                        ) = extract_paint_calibration_data(
+                            calibration_properties_path=Path(properties_file),
+                            power_plant_position=self.power_plant_position,
+                            coord_system='local_enu',
+                            has_ideal_flux_center=False,
+                            device=self.device
+                        )
                 except KeyError:
                     log.warning(f"Missing calibration data in {properties_file}. Skipping this file.")
                     continue
@@ -154,8 +169,7 @@ class CalibrationDataLoader:
                 self.motor_positions[calibration_id] = motor_positions.to(self.device)
                 self.incident_rays[calibration_id] = torch.tensor([0.0, 0.0, 0.0, 1.0]).to(self.device) - sun_position.to(self.device)
                 self.receiver_targets[calibration_id] = calibration_target_name
-                
-                self.surface_normals[calibration_id] = surface_normal
+        
 
                 if self.load_flux_images:
                     flux_file = properties_file.replace(self.properties_file_ends_with,
@@ -226,16 +240,18 @@ class CalibrationDataLoader:
             sample_motor_positions = torch.stack([self.motor_positions[id] for id in sample_ids]).to(self.device)
             sample_incident_rays = torch.stack([self.incident_rays[id] for id in sample_ids]).to(self.device)
             sample_receiver_targets = [self.receiver_targets[id] for id in sample_ids]
-            surface_normals = torch.stack([self.surface_normals[id] for id in sample_ids]).to(self.device)
-
+            
             sample_data = {'cal_ids': sample_ids,
                           'sun_azimuths': [self.sun_azimuths[id] for id in sample_ids],
                           'sun_elevations': [self.sun_elevations[id] for id in sample_ids],
                           'flux_centers': sample_flux_centers,
                           'motor_positions': sample_motor_positions,
                           'incident_rays': sample_incident_rays,
-                          'receiver_targets': sample_receiver_targets,
-                          'surface_normals': surface_normals}
+                          'receiver_targets': sample_receiver_targets}
+            
+            if self.has_ideal_flux_center:
+                ideal_flux_centers = torch.stack([self.ideal_flux_centers[id] for id in sample_ids]).to(self.device)
+                sample_data['ideal_flux_centers'] = ideal_flux_centers
 
             if self.load_flux_images:
                 sample_flux_images = torch.stack([self.flux_images[id] for id in sample_ids]).to(self.device)
