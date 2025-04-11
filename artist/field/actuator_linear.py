@@ -151,6 +151,7 @@ class LinearActuators(Actuators):
         device = motor_positions.device
         _, increments, initial_stroke_lengths, offsets, pivot_radii, _ = self._get_stacked_parameters(device=device)
         
+        # see page 17, MA Leibauer
         stroke_lengths = motor_positions / increments + initial_stroke_lengths
         calc_step_1 = offsets**2 + pivot_radii**2 - stroke_lengths**2
         calc_step_2 = 2.0 * offsets * pivot_radii
@@ -192,7 +193,7 @@ class LinearActuators(Actuators):
         relative_angles = (
             initial_angles + delta_angles * (clockwise_axis_movements == 1) - delta_angles * (clockwise_axis_movements == 0)
         )
-        return relative_angles.squeeze(0)
+        return relative_angles
 
     def angles_to_motor_positions(
         self, angles: torch.Tensor, device: Union[torch.device, str] = "cuda"
