@@ -6,6 +6,7 @@ from torch.utils.tensorboard import SummaryWriter
 import logging
 import sys
 import os
+import copy
 
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from typing import Union, Literal, List, Tuple
@@ -36,6 +37,8 @@ logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] - [%(name)s] - 
 
 random_seed = 7
 
+
+torch.set_printoptions(precision=16)
 
 class CalibrationModel(nn.Module):
     """
@@ -73,6 +76,7 @@ class CalibrationModel(nn.Module):
         
         self.use_raytracing = bool(config['run']['use_raytracing'])
         self.has_ideal_flux_centers = bool(config['run']['use_ideal_flux_centers'])
+        self.random_seed = random_seed
         self.device = device
 
         # Set up a raytracer. Before that, heliostat needs to be aligned (doesn't matter with which direction).
@@ -116,40 +120,64 @@ class CalibrationModel(nn.Module):
         self.optimizer, self.scheduler = self.setup_optimizer(optimizer=model_config['optimizer_type'],
                                                               scheduler=model_config['scheduler_type'],
                                                               # param_groups=model_config['param_groups'],  #TODO: complete model config
-                                                              initial_lr=model_config['init_learning_rate'],
+                                                              config=model_config
                                                               )
 
-        self.log_dir=Path(rf'/dss/dsshome1/05/di38kid/data/results/runs/{self.name}')
-        self.tb_logger = TensorboardLogger(name=self.name, log_dir=self.log_dir/'log')
+        self.save_dir = Path(rf'/dss/dsshome1/05/di38kid/data/results/runs/{self.name}')
+        self.tb_logger = TensorboardLogger(name=self.name, log_dir=self.save_dir/'log')
         self.loss_type = None
 
+    def replace_scenario(
+        self,
+        new_scenario
+    ):
+        log.info(f"Replacing scenario in {self.name}.")
+        self.scenario = new_scenario
+        self.heliostat_field = new_scenario.heliostat_field
+        self.target_areas = {area.name: area for area in new_scenario.target_areas.target_area_list}
+        
+        self.heliostat_field.align_surfaces_with_incident_ray_direction(
+            incident_ray_direction = torch.tensor(
+                [0.0, 1.0, 0.0, 0.0], device=self.device),  # south direction
+                device=self.device
+            )
+        
+        # TODO: Implement distributed environment, paste world_size and rank here.
+        self.raytracer = HeliostatRayTracer(
+            scenario=self.scenario,
+            world_size=1,
+            rank=0,
+            batch_size=1,
+            random_seed=self.random_seed
+            )
+        
+        self.learnable_parameters = (
+            get_rigid_body_kinematic_parameters_from_scenario(
+                kinematic=self.heliostat_field.rigid_body_kinematic
+            )
+        )
+
+        self.optimizer.params = self.learnable_parameters.parameters()
+    
     def setup_optimizer(
             self,
             optimizer: Literal['Adam'] = 'Adam',
             scheduler: Literal['ReduceLROnPlateau', 'CyclicLR'] = 'ReduceLROnPlateau',
-            param_groups: List[List[str]] = None,
-            initial_lr: Union[float, List] = 0.00001,
-            lr_factor: float = 0.1,
-            lr_patience: int = 10,
-            lr_threshold: float = 0.1,
-            threshold_mode: Literal['abs', 'rel'] = 'abs'
-    ):
+            config = {}
+    ):  
+        initial_lr =config['init_learning_rate']
+        max_lr = config['max_lr']
+        min_lr = config['min_lr']
         optimizer_kwargs = []
-        scheduler_kwargs = {'base_lr': None, 'max_lr': None}
+        param_groups = config['parameter_grouping']
         # param_groups = create_parameter_groups(self.learnable_parameters, num_heliostats=self.heliostat_field.number_of_heliostats)
         # TODO: Set-up optimizers and schedulers nicely
         if isinstance(optimizer, str):
             if optimizer == 'Adam':
-                if param_groups is None:
+                if len(param_groups) == 0:
                     self.optimizer = torch.optim.Adam(
                         self.learnable_parameters.parameters(), lr=initial_lr[0]
                     )
-                else:
-                    for i, param_group in enumerate(param_groups):
-                        params = [self.learnable_parameters[param] for param in param_group]
-                        optimizer_kwargs.append({'params': params, 'lr': initial_lr[i]})
-                    scheduler_kwargs['base_lr'] = [lr / 10 for lr in initial_lr]
-                    scheduler_kwargs['max_lr'] = [lr for lr in initial_lr]
                 # self.optimizer = torch.optim.Adam(optimizer_kwargs)
             elif optimizer == 'AdamW':
                 self.optimizer = torch.optim.AdamW(
@@ -161,39 +189,51 @@ class CalibrationModel(nn.Module):
                     )
         else:
             raise ValueError(f"Optimizer must be given as str.")
-        if scheduler is not None:
+        
+        schedulers = []
+        if not scheduler == "None":
+            warmup_scheduler = torch.optim.lr_scheduler.ConstantLR(
+                        optimizer=self.optimizer,
+                        factor=config['warmup_lr_factor'], 
+                        total_iters=config['warmup_epochs']
+                    )
+            schedulers.append(warmup_scheduler)
+
             if scheduler == 'ReduceLROnPlateau':
-                self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer=self.optimizer,
-                    factor=lr_factor,
-                    patience=lr_patience,
-                    threshold=lr_threshold,
-                    threshold_mode=threshold_mode
+                    factor=config['lr_factor'],
+                    patience=config['lr_patience'],
                 )
             elif scheduler == 'CyclicLR':
-                self.scheduler = torch.optim.lr_scheduler.CyclicLR(
+                scheduler = torch.optim.lr_scheduler.CyclicLR(
                     optimizer=self.optimizer,
-                    base_lr=scheduler_kwargs['base_lr'],
-                    max_lr=scheduler_kwargs['max_lr'],
-                    step_size_up=100,
-                    step_size_down=50,
-                    mode='triangular2',
+                    base_lr=min_lr[0],
+                    max_lr=max_lr[0],
+                    step_size_up=config['num_epochs'] - config['warmup_epochs'],
+                    mode='triangular',
                     gamma=1.0,
                     scale_mode='cycle',
                     cycle_momentum=False,
                     base_momentum=0.8,
                     max_momentum=0.9,
-                    last_epoch=-1
                 )
             elif scheduler == 'OneCycleLR':
-                self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                scheduler = torch.optim.lr_scheduler.OneCycleLR(
                     optimizer=self.optimizer,
                     total_steps=150,
                     max_lr=0.01,
                     div_factor=1e-6 / 1e-10
                 )
             elif scheduler == 'CosineAnnealingLR':
-                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer=self.optimizer,
+                    T_max=150,  # TODO: Use max epochs here
+                    eta_min=1e-6                    
+                )
+            
+            elif scheduler == 'CosineAnnealingWarmRestarts ':
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts (
                     optimizer=self.optimizer,
                     T_max=150,  # TODO: Use max epochs here
                     eta_min=1e-6                    
@@ -203,20 +243,37 @@ class CalibrationModel(nn.Module):
                 raise ValueError(
                     "Scheduler name not found, change name or implement new scheduler."
                     )
+            
+            schedulers.append(scheduler)
+            
+        else:
+            constant_scheduler = torch.optim.lr_scheduler.ConstantLR(
+                        optimizer=self.optimizer,
+                        factor=1, 
+                        total_iters=config['num_epochs']
+                    )
+            schedulers.append(constant_scheduler)
+
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer=self.optimizer,
+            schedulers=schedulers,
+            milestones=[schedulers[0].total_iters]
+        )
+        
         log.info(f"Optimizer and Scheduler setup complete.")
         return self.optimizer, self.scheduler
 
     def forward(
-            self,
-            heliostats_and_calib_ids: dict[str, List[int]],
-            mode: Literal['Train', 'Validation', 'Test'],  # needed for logging
-            epoch: int,
-            do_plotting: bool = False,
-            device: Union[torch.device, str] = "cuda"
-            ):
+        self,
+        heliostats_and_calib_ids: dict[str, List[int]],
+        mode: Literal['Train', 'Validation', 'Test', 'None'],  # needed for logging
+        epoch: int = 0,
+        do_plotting: bool = False,
+        device: Union[torch.device, str] = "cuda"
+        ):
         """Generate model output for the next step"""
         device = torch.device(device)
-        # self.heliostat_field.is_aligned = True
+        self.tb_logger.set_mode(mode)
         
         field_batch = self.calibration_data_loader.get_field_batch(
             heliostats_and_calib_ids=heliostats_and_calib_ids
@@ -225,40 +282,51 @@ class CalibrationModel(nn.Module):
         # number of samples per heliostat in field
         num_samples = len((field_batch))
         num_heliostats = self.heliostat_field.number_of_heliostats
-        target_reflection_directions = torch.zeros((num_samples, num_heliostats, 4), device=device)
-        target_flux_centers = torch.zeros((num_samples, num_heliostats, 4), device=device)
-        pred_reflection_directions = torch.zeros((num_samples, num_heliostats, 4), device=device)
-        pred_flux_centers = torch.zeros((num_samples, num_heliostats, 4), device=device)
+        
+        # Use float64 for all direction and position tensors
+        target_reflection_directions = torch.zeros((num_samples, num_heliostats, 4), device=device, dtype=torch.float64)
+        target_flux_centers = torch.zeros((num_samples, num_heliostats, 4), device=device, dtype=torch.float64)
+        pred_reflection_directions = torch.zeros((num_samples, num_heliostats, 4), device=device, dtype=torch.float64)
+        pred_flux_centers = torch.zeros((num_samples, num_heliostats, 4), device=device, dtype=torch.float64)
+        
+        # Keep bitmaps at original precision (likely float32)
         pred_bitmaps = torch.zeros((num_samples, num_heliostats, 256, 256), device=device)
         diff_bitmaps = torch.zeros_like(pred_bitmaps).to(device=device)
         
         import time
         start = time.time()
         for sample, data in enumerate(field_batch):
-            target_flux_centers[sample] = data['flux_centers']
-            incident_ray_directions = data['incident_rays']
+            # Convert loaded data to float64
+            target_flux_centers[sample] = data['flux_centers'].to(dtype=torch.float64)
+            incident_ray_directions = data['incident_rays'].to(dtype=torch.float64)
             target_area_names = data['receiver_targets']
             target_areas = [self.scenario.get_target_area(name) for name in target_area_names]
             
+            # Ensure motor positions are float64
+            motor_positions_float64 = data['motor_positions'].to(dtype=torch.float64)
             self.heliostat_field.align_surfaces_with_motor_positions(
-                motor_positions=data['motor_positions'],
+                motor_positions=motor_positions_float64,
                 device=device
             )
-            sample_orientations = self.heliostat_field.rigid_body_kinematic.orientations
+            sample_orientations = self.heliostat_field.rigid_body_kinematic.orientations.to(dtype=torch.float64)
             
             for n_heliostat in range(num_heliostats):
                 target_area = target_areas[n_heliostat]
                 
                 if self.has_ideal_flux_centers:  # calibration data contains ideal flux centers
                     target_reflection_directions[sample, n_heliostat] = (
-                        data['ideal_flux_centers'][n_heliostat] - sample_orientations[n_heliostat, 0:4, 3]
+                        data['ideal_flux_centers'][n_heliostat].to(dtype=torch.float64) - sample_orientations[n_heliostat, 0:4, 3]
                         )
+
+                    #print(data['ideal_flux_centers'][n_heliostat])
+                    #print(sample_orientations[n_heliostat, 0:4, 3])
                 else:
                     target_reflection_directions[sample, n_heliostat] = (
-                        data['flux_centers'][n_heliostat] - sample_orientations[n_heliostat, 0:4, 3]
+                        data['flux_centers'][n_heliostat].to(dtype=torch.float64) - sample_orientations[n_heliostat, 0:4, 3]
                         )
                     
             if self.use_raytracing:
+                # Keep raytracing in original precision for bitmap generation
                 sample_bitmaps = self.raytracer.trace_rays_separate(
                     incident_ray_directions=incident_ray_directions,
                     target_areas=target_areas,
@@ -271,13 +339,14 @@ class CalibrationModel(nn.Module):
                     if pred_bitmap.sum() > 0.0001:  # heliostat might miss target area
                         target_area = target_areas[n_heliostat]
                         
+                        # Ensure center of mass calculation is in float64
                         center_of_mass = utils.get_center_of_mass(
                                 bitmap=sample_bitmaps[n_heliostat],
-                                target_center=target_area.center,
-                                plane_e=target_area.plane_e,
-                                plane_u=target_area.plane_u,
+                                target_center=target_area.center.to(dtype=torch.float64) if hasattr(target_area.center, 'to') else target_area.center,
+                                plane_e=target_area.plane_e.to(dtype=torch.float64) if hasattr(target_area.plane_e, 'to') else target_area.plane_e,
+                                plane_u=target_area.plane_u.to(dtype=torch.float64) if hasattr(target_area.plane_u, 'to') else target_area.plane_u,
                                 device=device
-                            )
+                            ).to(dtype=torch.float64)
                         
                         concentrator_origin = sample_orientations[n_heliostat, 0:4, 3]
                         pred_reflection_direction = (
@@ -285,40 +354,42 @@ class CalibrationModel(nn.Module):
                         )
 
                     else:
-                        # TODO: Remove print after debugging
-                        # print(f"Energy in flux pred low for: {self.heliostat_field.all_heliostat_names[n_heliostat]}:  {sample}")
+                        # Convert to float64 for the calculations
                         concentrator_normal = sample_orientations[n_heliostat, 0:4, 2]
-                        concentrator_normal = concentrator_normal / torch.norm(concentrator_normal)  # normalize
+                        concentrator_normal = concentrator_normal / torch.norm(concentrator_normal, dtype=torch.float64)  # normalize
                         
                         pred_reflection_direction = raytracing_utils.reflect(
                             incident_ray_directions[n_heliostat], concentrator_normal
                             )
-    
-                        # TODO: Remove empty bitmap and use simple alignment loss
+                        #print(pred_reflection_direction)
+                            
                     pred_reflection_directions[sample][n_heliostat] = pred_reflection_direction
                 
             else: # No raytracing, calculate error from orientations.
                 concentrator_normals = sample_orientations[:, 0:4, 2]
-                concentrator_normals = concentrator_normals / torch.norm(concentrator_normals, dim=1, keepdim=True)  # normalize
+                # Use float64 for norm calculation
+                concentrator_normals = concentrator_normals / torch.norm(concentrator_normals, dim=1, keepdim=True, dtype=torch.float64)  # normalize
+                
                 for n_heliostat in range(num_heliostats):
-                    # pred_reflection_directions[sample, n_heliostat] = raytracing_utils.reflect(
-                    #     incident_ray_directions[n_heliostat], concentrator_normals[n_heliostat]
-                    #     )
                     target_area = target_areas[n_heliostat]
+                    # Ensure reflection calculation is in float64
                     reflected_ray = raytracing_utils.reflect(
                         incident_ray_directions[n_heliostat], concentrator_normals[n_heliostat]
                         )
+                    #print(reflected_ray)
+                    # Ensure intersection calculation is in float64
                     center_point, t = util.calculate_intersection(
                         ray_origin=sample_orientations[n_heliostat, 0:4, 3],
                         ray_direction=reflected_ray,
-                        plane_center=target_area.center,
-                        plane_normal=target_area.normal_vector,
+                        plane_center=target_area.center.to(dtype=torch.float64) if hasattr(target_area.center, 'to') else target_area.center,
+                        plane_normal=target_area.normal_vector.to(dtype=torch.float64) if hasattr(target_area.normal_vector, 'to') else target_area.normal_vector,
                     )
                     pred_flux_centers[sample, n_heliostat] = center_point
                     pred_reflection_directions[sample, n_heliostat] = (
                         center_point - sample_orientations[n_heliostat, 0:4, 3]
                         )
-                             
+                    #print(center_point)
+                            
         end = time.time()
         # print('forward loop took:', end-start)
         
@@ -327,77 +398,24 @@ class CalibrationModel(nn.Module):
             target_bitmaps = torch.stack([sample['flux_images'] for sample in field_batch]).to(device)
         #     pred_bitmaps = self.rescale_flux_bitmaps(pred_bitmaps, target_bitmaps)
         #     diff_bitmaps = target_bitmaps - pred_bitmaps
-            
-        #     contour_bitmaps = contour_difference(predictions=pred_bitmaps, 
-        #                                         targets=target_bitmaps, 
-        #                                         threshold=0.5, 
-        #                                         sharpness=20.0)
-        
-        if do_plotting:
-            import matplotlib.pyplot as plt
-            fig, axs = plt.subplots(nrows=num_heliostats,
-                                    ncols=num_samples, 
-                                    figsize=(150, 10))
-            for s in range(num_samples):
-                for h in range(num_heliostats):
-                    heliostat_name = self.heliostat_field.all_heliostat_names[h]
-                    cal_id = heliostats_and_calib_ids[heliostat_name][s]
-                    axs[h][s].imshow(pred_bitmaps[s][h].cpu().detach(), cmap="inferno")
-                    axs[h][s].set_title(f"Sample {s}, {int(cal_id)}", fontsize=10)
-                    axs[h][s].set_xticks([])
-                    axs[h][s].set_yticks([])
-                    if s == 0:
-                        # Add heliostat name as y-label for the first column
-                        axs[h][s].set_ylabel(heliostat_name, fontsize=12, rotation=0, 
-                                            horizontalalignment='right', verticalalignment='center')
-            fig.suptitle(f"Flux Predictions: {self.name}", fontsize=16)
-            plt.tight_layout()
-            
-            plt.subplots_adjust(top=0.9, left=0.1)  # This creates space for the title
-            plt.savefig(f"/dss/dsshome1/05/di38kid/data/results/plots/flux_pred.png")
-
-            for s in range(num_samples):
-                for h in range(num_heliostats):
-                    axs[h][s].imshow(target_bitmaps[s][h].cpu().detach(), cmap="inferno")
-            fig.suptitle(f"Ground Truth: {self.name}", fontsize=16)
-            plt.tight_layout()
-            
-            plt.subplots_adjust(top=0.9, left=0.1)  # This creates space for the title
-            plt.savefig(f"//dss/dsshome1/05/di38kid/data/results/plots/flux_target.png") 
-
-            for s in range(num_samples):
-                for h in range(num_heliostats):
-                    axs[h][s].imshow(diff_bitmaps[s][h].cpu().detach(), cmap="inferno")
-            fig.suptitle(f"Diff Flux (Prediction - Ground Truth): {self.name}", fontsize=16)
-            plt.tight_layout()
-            
-            plt.subplots_adjust(top=0.9, left=0.1)  # This creates space for the title
-            plt.savefig(f"//dss/dsshome1/05/di38kid/data/results/plots/flux_diff.png")        
         
         with torch.no_grad():  # calculate alignment accurately
             alignment_errors = self.eval_angles_mrad(
                     pred_reflection_directions, 
                     target_reflection_directions
                 )
-            
-        # print(f"\talignment errors:")
-        # for sample, field_errors in enumerate(alignment_errors.tolist()):
-        #     print(f'\t\t[{sample}]: {field_errors}')
-        # print()
         
         avg_per_heliostat = alignment_errors.mean(dim=0)
-        print(f"\t[{mode}]: average errors: {avg_per_heliostat.tolist()}")
-        
         avg_of_field = avg_per_heliostat.mean()
-        print(f"\t[{mode}]: average over whole field: {avg_of_field.item()}")
-        self.tb_logger.log_metric("AlignmentErrors_mrad/Average", avg_of_field.item(), mode, epoch)
-
         flat_errors = alignment_errors.flatten()
         median_error = torch.median(flat_errors)
-        self.tb_logger.log_metric("AlignmentErrors_mrad/Median", median_error.item(), mode, epoch)
+        print(f"\t[{mode}]: average over whole field: {avg_of_field.item()}")
         # print(f"\tmedian over whole field: {median_error.item()}")
+        print(f"\t[{mode}]: average errors: {avg_per_heliostat.tolist()}")
+        self.tb_logger.log_metric("AlignmentErrors_mrad/Average", avg_of_field.item(), epoch)
+        self.tb_logger.log_metric("AlignmentErrors_mrad/Median", median_error.item(), epoch)
 
-        if self.use_raytracing:
+        if self.use_raytracing:  # Calculate loss
             angels_for_loss = self.robust_angles_mrad(
                                     pred_reflection_directions, 
                                     target_reflection_directions
@@ -405,155 +423,129 @@ class CalibrationModel(nn.Module):
             
             mae = torch.nn.L1Loss()
             # mean absolute aligment eror [mrad]
-            maae = mae(errors_for_loss, torch.ones_like(angels_for_loss))
+            maae = mae(errors_for_loss, torch.ones_like(angels_for_loss, dtype=torch.float64))
             
             mse = torch.nn.MSELoss()
             # mean squared alignment error [mrad **2]
-            msae = mse(errors_for_loss, torch.ones_like(angels_for_loss)) 
+            msae = mse(errors_for_loss, torch.ones_like(angels_for_loss, dtype=torch.float64)) 
             loss = msae
             
             rmse = torch.sqrt(msae)
             print(f"\tMSAE: {msae.item()}")
-            
+    
             # Calculate per-heliostat MAE on bitmaps
             # mspe_per_heliostat = torch.mean(torch.square(pred_bitmaps - target_bitmaps), dim=(0, 2, 3))
             # Get overall MAE from per-heliostat values if needed
             # overall_mspe = torch.mean(mspe_per_heliostat)
             
             mape = diff_bitmaps.abs().mean()
-            # mspe = mse(pred_bitmaps, target_bitmaps)
-            # print(f"\tMSPE: {mspe_per_heliostat.tolist()}")
-            # print(f"\tField MSPE: {overall_mspe.item()}")
-            # print(f"\tField MSPE: {mspe.item()}")
-            
-            # chamfer_loss = chamfer_distance(flux_bitmap_pred[0], flux_bitmaps[0])
-            # ssim_fnc = StructuralSimilarityIndexMeasure().to(device)
-            # ssim = ssim_fnc(pred_bitmaps.reshape(-1, 256, 256).unsqueeze(1), 
-            #                 target_bitmaps.reshape(-1, 256, 256).unsqueeze(1))
-            # print(f"\tSSIM: {ssim.item()}")
-            
-            # chamfer_distances = chamfer_distance_batch_optimized(pred_bitmaps.reshape(-1, 256, 256), 
-            #                                                      target_bitmaps.reshape(-1, 256, 256))
-            # non_zero_mask = chamfer_distances != 0.0
-            # non_zero_count = non_zero_mask.sum()
-            # Calculate mean of non-zero values
-            # mean_chd = chamfer_distances[non_zero_mask].sum() / non_zero_count
-            # mean_chd = chamfer_distances.mean()
-            
-            # loss_type = '(1 - Structural Similarity Index)'
-            # chamfer_distances = chamfer_distance_batch(pred_bitmaps.reshape(-1, 256, 256), 
-            #                                            target_bitmaps.reshape(-1, 256, 256))
-            # chd = chamfer_distances.mean()
-            
-            # print(f"\tCHD: {mean_chd.item()}")
-            
-            # Calculate combined loss from alignment MSE and flux MSE.
-            # alpha = 0.8
-            # loss = alpha * msae + (1 - alpha) * mspe
-            # TODO: Make alpha learnable https://github.com/Helmholtz-AI-Energy/propulate/blob/main/tutorials/nm_example.py
-            # loss = alpha * mean_chd + (1-alpha) * maae 
-            
-            # self.tb_logger.log_loss("MeanCHD", mean_chd.item(), mode, epoch)
-            self.tb_logger.log_loss("MAAE", maae.item(), mode, epoch)
-            self.tb_logger.log_loss("MSAE", msae.item(), mode, epoch)
-            self.tb_logger.log_loss("RMSAE", rmse.item(), mode, epoch)
-            # self.tb_logger.log_loss("MeanSSIM", ssim.item(), mode, epoch)
-            # self.tb_logger.log_loss("MAPE", mape.item(), mode, epoch)
-            # self.tb_logger.log_loss("MSPE", mspe.item(), mode, epoch)
-            self.tb_logger.log_loss("MeanCHD+MAAE", loss.item(), mode, epoch)
+            self.tb_logger.log_loss("MAAE", maae.item(), epoch)
+            self.tb_logger.log_loss("MSAE", msae.item(), epoch)
+            self.tb_logger.log_loss("RMSAE", rmse.item(), epoch)
+            self.tb_logger.log_loss("MeanCHD+MAAE", loss.item(), epoch)
 
-        else:
+        else:  # Calculate Loss
             l1 = torch.nn.L1Loss()
             mse = torch.nn.MSELoss()
-            cos_angles_for_loss = self.robust_angles(
+            angles_mrad_for_loss, cos_angles_for_loss = self.robust_angles_mrad(
                                     pred_reflection_directions, 
                                     target_reflection_directions
-                                )
-            msae = mse(cos_angles_for_loss, torch.ones_like(cos_angles_for_loss)) * 1000000
-            center_loss = l1(pred_flux_centers, target_flux_centers)
-            loss = msae
+                                    )
+            msae_cos = mse(cos_angles_for_loss, torch.ones_like(cos_angles_for_loss, dtype=torch.float64))
+  
+            msae = mse(angles_mrad_for_loss, torch.zeros_like(angles_mrad_for_loss, dtype=torch.float64))
+            
+            msae_center = mse(pred_flux_centers, target_flux_centers)
+            
             rmsae = torch.sqrt(msae)
-            self.tb_logger.log_loss("MSAE", msae.item(), mode, epoch)
-            self.tb_logger.log_loss("RMSAE", rmsae.item(), mode, epoch)
+
+            self.tb_logger.log_loss("MSAE", msae.item(), epoch)
+            self.tb_logger.log_loss("MSAE_cos", msae_cos.item(), epoch)
+            self.tb_logger.log_loss("MSAE_center", msae_center.item(), epoch)
+            self.tb_logger.log_loss("RMSAE", rmsae.item(), epoch)
         
+        # Log metrics
         for n_heliostat, (heliostat_id, calib_ids) in enumerate(heliostats_and_calib_ids.items()):
             self.tb_logger.log_heliostat_metric("AlignmentErrors_mrad", 
-                                             heliostat_id, 
-                                             avg_per_heliostat.tolist()[n_heliostat], 
-                                             mode, 
-                                             epoch)
+                                            heliostat_id, 
+                                            avg_per_heliostat.tolist()[n_heliostat], 
+                                            epoch)
             
             for n_sample, (calib_id, error) in enumerate(zip(calib_ids, alignment_errors[:, n_heliostat].tolist())):
                 self.tb_logger.log_heliostat_metric("AlignmentErrors_mrad", 
-                                                 heliostat_id, 
-                                                 error, 
-                                                 mode, 
-                                                 epoch, 
-                                                 calib_id=calib_id)
-                if self.use_raytracing:
-                    self.tb_logger.log_image("FluxPredictions", 
-                                          heliostat_id, 
-                                          pred_bitmaps[n_sample, n_heliostat, :, :], 
-                                          mode, 
-                                          epoch, 
-                                          calib_id=calib_id)
-                    # if epoch == 1:
-                    #     self.tb_logger.log_image("FluxGroundtruths", 
-                    #                           heliostat_id, 
-                    #                           target_bitmaps[n_sample, n_heliostat, :, :], 
+                                                heliostat_id, 
+                                                error, 
+                                                epoch, 
+                                                calib_id=calib_id)
                     
-                    #                           mode, 
-                    #                           epoch, 
-                    #                           calib_id=calib_id)
-                    
-                    # self.tb_logger.log_image("FluxDiffs", 
-                    #                       heliostat_id, 
-                    #                       diff_bitmaps[n_sample, n_heliostat, :, :], 
-                    #                       mode, 
-                    #                       epoch, 
-                    #                       calib_id=calib_id)
-                    
-                    # self.tb_logger.log_image("ContourDiffs", 
-                    #                      heliostat_id, 
-                    #                      contour_bitmaps[n_sample, n_heliostat, :, :], 
-                    #                      mode, 
-                    #                      epoch, 
-                    #                      calib_id=calib_id)
-                    
-        return alignment_errors, loss
+        return alignment_errors, msae_cos
 
     @staticmethod
-    def robust_angles(
+    def robust_angles_mrad(
             v1: torch.Tensor,
             v2: torch.Tensor,
             epsilon: float = 1e-10
-            ) -> torch.Tensor:
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
         # in case v1 or v2 have shape (4,), bring to (1, 4)
         assert v1.shape == v2.shape, 'Given Tensors must have identical shapes.'
+        
+        # Ensure v1 and v2 are float64
+        v1 = v1.to(dtype=torch.float64)
+        v2 = v2.to(dtype=torch.float64)
+        
         while v1.dim() < 3:  
             v1 = v1.unsqueeze(0)  # bring to [B, H, 4] 
             v2 = v2.unsqueeze(0) 
 
-        m1 = torch.norm(v1, dim=-1)
-        m2 = torch.norm(v2, dim=-1)
+        # Use float64 for all vector operations
+        m1 = torch.norm(v1, dim=-1, dtype=torch.float64)
+        m2 = torch.norm(v2, dim=-1, dtype=torch.float64)
         dot_products = torch.sum(v1 * v2, dim=-1)
         cos_angles = dot_products / (m1 * m2 + epsilon)  # avoid division by zero
-        return cos_angles
-    
+        angles_rad = torch.acos(
+            torch.clip(cos_angles, -1.0 + 1e-7, 1.0 - 1e-7)
+        )
+        return (angles_rad * 1000), cos_angles
+
     @staticmethod
     def eval_angles_mrad(
             v1: torch.Tensor,
             v2: torch.Tensor,
             ) -> torch.Tensor:
-        m1 = torch.norm(v1, dim=-1)
-        m2 = torch.norm(v2, dim=-1)
+        # Ensure v1 and v2 are float64
+        v1 = v1.to(dtype=torch.float64)
+        v2 = v2.to(dtype=torch.float64)
+        
+        # Use float64 for all vector operations
+        m1 = torch.norm(v1, dim=-1, dtype=torch.float64)
+        m2 = torch.norm(v2, dim=-1, dtype=torch.float64)
         dot_products = torch.sum(v1 * v2, dim=-1)
         cos_angles = dot_products / (m1 * m2)
         angles_rad = torch.acos(
             torch.clip(cos_angles, -1.0, 1.0)
         )
-        return angles_rad * 1000
-
+        return angles_rad * 1000  # Convert to milliradians
+    
+    def freeze_parameters(
+        self,
+        freeze_parameters: List[str]
+    ):
+        # Iterate over the nested parameters and freeze / unfreeze
+        # Names and parameter lists in the learnable parameters dict
+        for name, param_group in self.learnable_parameters.items():
+            grad = True  
+            # Check if the parameter group 
+            if name in freeze_parameters:
+                print(f"Freezing parameters in '{name}'.") 
+                grad = False
+            for params in param_group:
+                if isinstance(params, (torch.nn.ParameterList, list, tuple)):
+                    for param in params:
+                        param.requires_grad = grad      
+                else:
+                    params.requires_grad = grad
+    
+    
     def calibrate(
             self,
             split_type: str,
@@ -589,9 +581,7 @@ class CalibrationModel(nn.Module):
         epoch = 1
         avg_valid_error = torch.inf
         while epoch <= num_epochs and avg_valid_error > tolerance:
-            
-            if epoch > 90:
-                self.heliostat_field.rigid_body_kinematic.all_deviations_params['first_joint_tilt_n'][0].data = torch.tensor(0.0, device=self.device)
+
             self.train()
             self.optimizer.zero_grad()
 
@@ -630,16 +620,16 @@ class CalibrationModel(nn.Module):
                     do_plotting=False,
                     device=device
                 )
-            self.scheduler.step(valid_loss)
+            self.scheduler.step()
 
             avg_train_error = train_alignment_errors.mean()
             avg_valid_error = valid_alignment_errors.mean()
 
             if epoch % log_steps == 0:
                 log.info(f"Epoch: {epoch} of {num_epochs} max, "
-                         f"Train / Valid Loss: {train_loss.item():.4f} / {valid_loss.item():.4f}, "
-                         f"Avg Train / Valid Error (mrad): {avg_train_error.item():.2f} / {avg_valid_error.item():.2f}, "
-                         # f"LR: {self.scheduler.get_last_lr()}"
+                         f"Train / Valid Loss: {train_loss.item()} / {valid_loss.item()}, "
+                         f"Avg Train / Valid Error (mrad): {avg_train_error.item():.4f} / {avg_valid_error.item():.4f}, "
+                         f"LR: {self.scheduler.get_last_lr()}"
                          )
 
             epoch += 1
@@ -671,14 +661,8 @@ class CalibrationModel(nn.Module):
 
             avg_test_error = test_alignment_errors.mean()
 
-            # summary.scalar("Loss/Test", test_loss.detach().numpy(), epoch)
-            # summary.scalar("AvgError/Test", avg_test_error.detach().numpy(), epoch)
-
-            # for calib_id, error in zip(calibration_ids, test_alignment_errors):
-            #     summary.scalar(f"Errors/Valid/{calib_id}", error.detach().numpy(), epoch)
-
-            log.info(f"Test Loss: {test_loss.item():.4f}, "
-                     f"Avg Test Error (mrad): {avg_test_error.item():.2f}")
+            log.info(f"Test Loss: {test_loss.item()}, "
+                     f"Avg Test Error (mrad): {avg_test_error.item():.4f}")
 
     def _log_parameters(self, epoch, obj=None, name=None, heliostat_idx=None, index=None):
         if obj is None:
@@ -744,7 +728,6 @@ class CalibrationModel(nn.Module):
         dist_fig = reader.visualize_final_error_distribution()
         dist_fig.savefig(f'/dss/dsshome1/05/di38kid/data/results/plots/{model_name}_error_distribution.png')
 
-    
     @staticmethod
     def rescale_flux_bitmaps(
         predictions: torch.Tensor,
@@ -763,6 +746,97 @@ class CalibrationModel(nn.Module):
         scaling_factors[non_zero_mask] = target_energy[non_zero_mask] / pred_energy[non_zero_mask]
         
         return predictions * scaling_factors
+
+    
+    def find_max_lr(
+        self,
+        heliostat_and_calib_dict: dict(),
+        restore_scenario,
+        start_lr: float = 1e-2,
+        end_lr: float = 100,
+        num_iterations = 100,
+        freeze_parameters = []
+    ):
+        
+        # Freeze / unfreeze parameters depending on selection
+        self.freeze_parameters(freeze_parameters)
+            
+        # Use Adam optimizer for finding max learning rate with 
+        optimizer = torch.optim.Adam(
+                self.learnable_parameters.parameters(), lr=start_lr
+                )
+            
+        # Set starting learning rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = start_lr
+            
+        # Determine the exponential factor for increasing the learning rate
+        gamma = (end_lr / start_lr) ** (1 / num_iterations)
+        
+        lrs = []
+        losses = []
+        
+        self.train()
+        
+        log.info("Searching for maximum learning rate...")
+        for i in range(num_iterations):
+
+            
+            optimizer.zero_grad()
+                
+            _, loss = self.forward(
+                mode='None',  # disable logging
+                heliostats_and_calib_ids=heliostat_and_calib_dict,
+                device=self.device
+            )
+            if loss.isnan():
+                log.info(f"Loss was nan at iteration {i} - search was stopped.")
+                break  # break search loop
+            loss.backward()
+            optimizer.step()
+            
+            lr = optimizer.param_groups[0]['lr']
+            lrs.append(lr)
+            losses.append(loss.item())
+            
+            # Increase learning rate for next iteration
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = param_group['lr'] * gamma
+                
+            if i % 10 == 0:
+                log.info(f"Iteration {i} / {num_iterations}, LR: {lr:.8f}, Loss: {loss.item():.8f}")
+        
+        # Store deep copy of kinematic class with its initial parameters
+        self.replace_scenario(restore_scenario)
+        
+        from matplotlib import pyplot as plt
+        plt.figure(figsize=(10, 6))
+        plt.semilogx(lrs, losses)
+        plt.xlabel('Learning Rate')
+        plt.ylabel('Loss: MSE (1 - cos(alignment error))')
+        plt.title('Learning Rate Range Test')
+        plt.grid(True)
+        # Create output directory if it doesn't exist
+        plots_dir = self.save_dir / 'plots'
+        os.makedirs(plots_dir, exist_ok=True)
+        plt.savefig(plots_dir / 'learning_rate_range_test.png')    
+        plt.close()
+        
+        plt.figure(figsize=(10, 6))
+        plt.loglog(lrs, losses)
+        plt.xlabel('Learning Rate')
+        plt.ylabel('Loss: MSE [1 - cos(alignment error)]')
+        plt.title('Learning Rate Range Test')
+        plt.grid(True)
+        # Create output directory if it doesn't exist
+        plots_dir = self.save_dir / 'plots'
+        os.makedirs(plots_dir, exist_ok=True)
+        plt.savefig(plots_dir / 'learning_rate_range_test__log.png')    
+        plt.close()
+        
+        log.warn("Restart calibration after using find_max_lr!")
+            
+            
     
     
     # TODO: Include Learning Rate finder.
