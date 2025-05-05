@@ -62,12 +62,12 @@ if __name__ == '__main__':
     for split_type in splits.keys():
         for split_sizes in splits[split_type].keys():
             print(f"{split_type}: {split_sizes}")
-            model.calibrate(num_epochs=30, 
+            model.calibrate(num_epochs=run_config['run']['num_epochs'], 
                             log_steps=1, 
                             split_type=split_type,
                             split_sizes=split_sizes, 
                             seed=run_config['run']['random_seed'],
-                            with_raytracing=True, 
+                            use_raytracing=bool(run_config['run']['use_raytracing']), 
                             run_config=run_config, device=device)
         
     # model.cuda()

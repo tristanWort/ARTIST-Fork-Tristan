@@ -70,6 +70,7 @@ class CalibrationDataLoader:
         self.power_plant_position = power_plant_position
 
         # Storage dictionaries for each data type
+        self.calibration_ids: Dict[str, int] = {}
         self.sun_azimuths: Dict[str, float] = {}
         self.sun_elevations: Dict[str, float] = {}
         self.flux_centers: Dict[str, torch.Tensor] = {}  # shape [4,]
@@ -167,25 +168,8 @@ class CalibrationDataLoader:
         """
         return self.calibration_ids.copy()
 
-    def get_batch(self, heliostat_id: str, cal_ids: List[int]) -> Dict[str, Union[torch.Tensor, List[str]]]:
-        """
-        Get a batch of calibration data for the specified calibration IDs.
-
-        Args:
-            cal_ids (List[str]): List of calibration IDs to include in the batch
-
-        Returns:
-            Dict: A dictionary containing batched data with the following keys:
-                - 'flux_centers': Tensor of shape [N, 4]
-                - 'motor_positions': Tensor of shape [N, 2]
-                - 'incident_rays': Tensor of shape [N, 4]
-                - 'receiver_targets': List of N target names
-                - 'flux_images': Tensor of shape [N, 256, 256]
-                - 'calibration_ids': List of N calibration IDs
-
-        Raises:
-            KeyError: If any of the requested calibration IDs are not available
-        """
+    def get_batch(self, heliostat_id: str, cal_ids: List[int]) -> Dict[str, Union[torch.Tensor, List[str]]]:        
+        
         # Check if all requested IDs are available
         missing_ids = set(cal_ids) - set(self.calibration_ids[heliostat_id])
         if missing_ids:
@@ -211,31 +195,18 @@ class CalibrationDataLoader:
 
         return batch_data
     
-    def get_field_batch(self, heliostats_and_calib_ids: Dict[str, List[int]]) -> Dict[str, Dict[str, Union[torch.Tensor, List[str]]]]:
-        """
-        Get a batch of calibration data for the specified calibration IDs.
-
-        Args:
-            field_batch Dict[str, List[int]]: Dictionary of heliostat IDs (str) and calibration IDs (int) to include in the batch
-
-        Returns:
-            Dict: A dictionary containing batched data with the following keys:
-                - 'flux_centers': Tensor of shape [N, 4]
-                - 'motor_positions': Tensor of shape [N, 2]
-                - 'incident_rays': Tensor of shape [N, 4]
-                - 'receiver_targets': List of N target names
-                - 'flux_images': Tensor of shape [N, 256, 256]
-                - 'calibration_ids': List of N calibration IDs
-
-        Raises:
-            KeyError: If any of the requested calibration IDs are not available
-        """
+    def get_field_batch(self, heliostats_and_calib_ids: Dict[str, List[int]] = {}) -> Dict[str, Dict[str, Union[torch.Tensor, List[str]]]]:
+        # Leave input dictionary empty to load all samples for all heliostats
+        
         # Check if all requested IDs are available
         missing_ids = (set(batch_id for ids in heliostats_and_calib_ids.values() for batch_id in ids)
                        - set(batch_id for ids in self.calibration_ids.values() for batch_id in ids))
         if missing_ids:
             raise KeyError(f"Calibration IDs not found in CalibrationDataLoader: {missing_ids}")
 
+        if len(heliostats_and_calib_ids) == 0:
+            heliostats_and_calib_ids = self.calibration_ids
+            
         sample_length = len(next(iter(heliostats_and_calib_ids.values())))
         
         field_batch = list()
@@ -266,18 +237,7 @@ class CalibrationDataLoader:
         return field_batch
 
     def get_single_item(self, cal_id: str) -> Dict[str, Any]:
-        """
-        Get data for a single calibration ID.
 
-        Args:
-            cal_id (str): The calibration ID to retrieve
-
-        Returns:
-            Dict: A dictionary containing the data for the requested calibration ID
-
-        Raises:
-            KeyError: If the requested calibration ID is not available
-        """
         if cal_id not in self.calibration_ids:
             raise KeyError(f"Calibration ID not found: {cal_id}")
 
@@ -295,15 +255,7 @@ class CalibrationDataLoader:
         return batch_data
 
     def filter_by_target(self, target_name: str) -> List[str]:
-        """
-        Filter calibration IDs by receiver target name.
-
-        Args:
-            target_name (str): The receiver target name to filter by
-
-        Returns:
-            List[str]: List of calibration IDs that match the target name
-        """
+        
         return [cal_id for cal_id in self.calibration_ids
                 if self.receiver_targets[cal_id] == target_name]
 
@@ -312,19 +264,7 @@ class CalibrationDataLoader:
             batch_size: int,
             seed: Optional[int] = None
     ) -> Dict[str, Union[torch.Tensor, List[str]]]:
-        """
-        Get a random batch of calibration data.
-
-        Args:
-            batch_size (int): Number of calibration points to include in the batch
-            seed (Optional[int]): Random seed for reproducibility.
-
-        Returns:
-            Dict: A dictionary containing batched data (same format as get_batch)
-
-        Raises:
-            ValueError: If batch_size is larger than the number of available calibration points
-        """
+        
         if batch_size > len(self.calibration_ids):
             raise ValueError(
                 f"Requested batch size {batch_size} exceeds available data size {len(self.calibration_ids)}")
@@ -341,6 +281,7 @@ class CalibrationDataLoader:
     def sun_positions_splits(
         self,
         config: Dict[str, Any],  # dictionary containing configuration for splits
+        save_sun_positions_splits_plots = True,
     ):
         # Create a DatasetSplitter instance.
         # Use remove_unused_data=False to preserve extra columns (e.g. azimuth, elevation) needed for plotting.
@@ -395,128 +336,128 @@ class CalibrationDataLoader:
 
             # Determine grid dimensions for subplots.
             # Here we use rows = number of validation sizes and columns = number of training sizes.
-            ncols = len(config['training_sizes'])
-            nrows = len(config['validation_sizes'])
-            num_plots = ncols * nrows
+            if save_sun_positions_splits_plots == True:
+                ncols = len(config['training_sizes'])
+                nrows = len(config['validation_sizes'])
+                num_plots = ncols * nrows
 
-            fig, axes = plt.subplots(
-                nrows=nrows, ncols=ncols, figsize=(6 * ncols, 5 * nrows), sharey=True
-            )
-
-            # Flatten axes so that we can iterate uniformly.
-            if num_plots == 1:
-                axes = [axes]
-            else:
-                axes = np.array(axes).flatten()
-
-            # For each combination, create a subplot.
-            for ax, ((training_size, validation_size), split_df) in zip(
-                axes, current_split_data.items()
-            ):
-                # Merge the split info into the full calibration data.
-                split_df_reset = (
-                    split_df.reset_index()
-                )  # bring the ID (index) back as a column
-                merged_data = pd.merge(
-                    calibration_data,
-                    split_df_reset[[mappings.ID_INDEX, mappings.SPLIT_KEY]],
-                    on=mappings.ID_INDEX,
-                    how="left",
+                fig, axes = plt.subplots(
+                    nrows=nrows, ncols=ncols, figsize=(6 * ncols, 5 * nrows), sharey=True
                 )
 
-                # Group by heliostat and split to count occurrences.
-                split_counts = (
-                    merged_data.groupby([mappings.HELIOSTAT_ID, mappings.SPLIT_KEY])
-                    .size()
-                    .unstack(fill_value=0)
-                )
-                # Add total counts for sorting and then drop the helper column.
-                split_counts[mappings.TOTAL_INDEX] = split_counts.sum(axis=1)
-                split_counts = split_counts.sort_values(
-                    by=mappings.TOTAL_INDEX, ascending=False
-                ).drop(columns=[mappings.TOTAL_INDEX])
-                # Reorder columns: train, then test, then validation.
-                split_counts = split_counts.reindex(
-                    columns=[
-                        mappings.TRAIN_INDEX,
-                        mappings.TEST_INDEX,
-                        mappings.VALIDATION_INDEX,
-                    ],
-                    fill_value=0,
-                )
+                # Flatten axes so that we can iterate uniformly.
+                if num_plots == 1:
+                    axes = [axes]
+                else:
+                    axes = np.array(axes).flatten()
 
-                # Replace the heliostat IDs with sequential numbers (for plotting purposes).
-                num_heliostats = len(split_counts)
-                split_counts.index = range(num_heliostats)
+                # For each combination, create a subplot.
+                for ax, ((training_size, validation_size), split_df) in zip(
+                    axes, current_split_data.items()
+                ):
+                    # Merge the split info into the full calibration data.
+                    split_df_reset = (
+                        split_df.reset_index()
+                    )  # bring the ID (index) back as a column
+                    merged_data = pd.merge(
+                        calibration_data,
+                        split_df_reset[[mappings.ID_INDEX, mappings.SPLIT_KEY]],
+                        on=mappings.ID_INDEX,
+                        how="left",
+                    )
 
-                # Determine the bar colors using the shared mapping.
-                colors = mappings.TRAIN_TEST_VAL_COLORS
-                bar_colors = [colors.get(split, "gray") for split in split_counts.columns]
+                    # Group by heliostat and split to count occurrences.
+                    split_counts = (
+                        merged_data.groupby([mappings.HELIOSTAT_ID, mappings.SPLIT_KEY])
+                        .size()
+                        .unstack(fill_value=0)
+                    )
+                    # Add total counts for sorting and then drop the helper column.
+                    split_counts[mappings.TOTAL_INDEX] = split_counts.sum(axis=1)
+                    split_counts = split_counts.sort_values(
+                        by=mappings.TOTAL_INDEX, ascending=False
+                    ).drop(columns=[mappings.TOTAL_INDEX])
+                    # Reorder columns: train, then test, then validation.
+                    split_counts = split_counts.reindex(
+                        columns=[
+                            mappings.TRAIN_INDEX,
+                            mappings.TEST_INDEX,
+                            mappings.VALIDATION_INDEX,
+                        ],
+                        fill_value=0,
+                    )
 
-                # Plot the stacked bar plot.
-                split_counts.plot(
-                    kind="bar", stacked=True, ax=ax, legend=False, color=bar_colors
-                )
-                # Change the x-axis label as requested.
-                ax.set_xlabel("Heliostats sorted by # measurements", fontsize=10)
-                ax.set_ylabel("Count", fontsize=10)
-                ax.tick_params(axis="x", rotation=45)
-                ticks = list(range(0, num_heliostats, 200))
-                ax.set_xticks(ticks)
+                    # Replace the heliostat IDs with sequential numbers (for plotting purposes).
+                    num_heliostats = len(split_counts)
+                    split_counts.index = range(num_heliostats)
 
-                # Set y-axis limits for KNN and KMEANS split types.
-                if split_type in [mappings.KMEANS_SPLIT, mappings.KNN_SPLIT]:
-                    ax.set_ylim(0, 500)
+                    # Determine the bar colors using the shared mapping.
+                    colors = mappings.TRAIN_TEST_VAL_COLORS
+                    bar_colors = [colors.get(split, "gray") for split in split_counts.columns]
 
-                # Set subplot title indicating the training and validation sizes.
-                ax.set_title(f"Train {training_size} / Val {validation_size}", fontsize=12)
+                    # Plot the stacked bar plot.
+                    split_counts.plot(
+                        kind="bar", stacked=True, ax=ax, legend=False, color=bar_colors
+                    )
+                    # Change the x-axis label as requested.
+                    ax.set_xlabel("Heliostats sorted by # measurements", fontsize=10)
+                    ax.set_ylabel("Count", fontsize=10)
+                    ax.tick_params(axis="x", rotation=45)
+                    ticks = list(range(0, num_heliostats, 200))
+                    ax.set_xticks(ticks)
 
-                heliostat_ids = merged_data[mappings.HELIOSTAT_ID].unique()
-                # ---- Add an inset for the example heliostat ----
-                example_heliostat_df = merged_data[
-                    merged_data[mappings.HELIOSTAT_ID] == heliostat_ids[0]
-                ]
-                inset_ax = inset_axes(
-                    ax,
-                    width="50%",
-                    height="50%",
-                    loc="upper right",
-                    bbox_to_anchor=(0, -0.05, 1, 1),
-                    bbox_transform=ax.transAxes,
-                )
-                for split, color in colors.items():
-                    subset = example_heliostat_df[
-                        example_heliostat_df[mappings.SPLIT_KEY] == split
+                    # Set y-axis limits for KNN and KMEANS split types.
+                    if split_type in [mappings.KMEANS_SPLIT, mappings.KNN_SPLIT]:
+                        ax.set_ylim(0, 500)
+
+                    # Set subplot title indicating the training and validation sizes.
+                    ax.set_title(f"Train {training_size} / Val {validation_size}", fontsize=12)
+
+                    heliostat_ids = merged_data[mappings.HELIOSTAT_ID].unique()
+                    # ---- Add an inset for the example heliostat ----
+                    example_heliostat_df = merged_data[
+                        merged_data[mappings.HELIOSTAT_ID] == heliostat_ids[0]
                     ]
-                    if not subset.empty:
-                        inset_ax.scatter(
-                            subset[mappings.AZIMUTH],
-                            subset[mappings.ELEVATION],
-                            color=color,
-                            alpha=0.5,
-                        )
-                inset_ax.set_title(f"Heliostat {heliostat_ids[0]}", fontsize=8, pad=-5)
-                inset_ax.set_xlabel("Azimuth", fontsize=8)
-                inset_ax.set_ylabel("Elevation", fontsize=8)
-                inset_ax.tick_params(axis="both", labelsize=8)
+                    inset_ax = inset_axes(
+                        ax,
+                        width="50%",
+                        height="50%",
+                        loc="upper right",
+                        bbox_to_anchor=(0, -0.05, 1, 1),
+                        bbox_transform=ax.transAxes,
+                    )
+                    for split, color in colors.items():
+                        subset = example_heliostat_df[
+                            example_heliostat_df[mappings.SPLIT_KEY] == split
+                        ]
+                        if not subset.empty:
+                            inset_ax.scatter(
+                                subset[mappings.AZIMUTH],
+                                subset[mappings.ELEVATION],
+                                color=color,
+                                alpha=0.5,
+                            )
+                    inset_ax.set_title(f"Heliostat {heliostat_ids[0]}", fontsize=8, pad=-5)
+                    inset_ax.set_xlabel("Azimuth", fontsize=8)
+                    inset_ax.set_ylabel("Elevation", fontsize=8)
+                    inset_ax.tick_params(axis="both", labelsize=8)
 
-            # Create a common legend (placed in the upper left of the first subplot).
-            legend_handles = [
-                mpatches.Patch(color=colors[split], label=split.capitalize())
-                for split in colors
-            ]
-            axes[0].legend(handles=legend_handles, loc="upper left", fontsize=10)
+                # Create a common legend (placed in the upper left of the first subplot).
+                legend_handles = [
+                    mpatches.Patch(color=colors[split], label=split.capitalize())
+                    for split in colors
+                ]
+                axes[0].legend(handles=legend_handles, loc="upper left", fontsize=10)
 
-            plt.tight_layout()
-            # Save the figure as "02_<split_type>_split.pdf"
-            file_name = plot_output_path / f"02_{split_type}_split.pdf"
-            plt.savefig(file_name, dpi=300)
-            plt.close(fig)
-            print(f"Saved plot for split type '{split_type}' to {file_name}")
+                plt.tight_layout()
+                # Save the figure as "02_<split_type>_split.pdf"
+                file_name = plot_output_path / f"02_{split_type}_split.pdf"
+                plt.savefig(file_name, dpi=300)
+                plt.close(fig)
+                print(f"Saved plot for split type '{split_type}' to {file_name}")
         
         self.splits = splits  #TODO: Load the splits from dataframe or csv file.
 
-    """Old split function. Use sun_positions_splits which was taken form paint."""
     def split_data(
         self,
         train_valid_test_sizes: Tuple[int,int,int] = (30, 15, 15),
@@ -524,18 +465,7 @@ class CalibrationDataLoader:
         n_clusters: Optional[int] = 5,
         seed: Optional[int] = 42
     ) -> Tuple[List[str],List[str],Optional[List[str]]]:
-        """
-        Split the data into train, validation, and test (optional) sets.
 
-        Args:
-            train_valid_test_sizes (Tuple[int,int,int]): 
-                Desired target sample lenght in training, validation, and testing batches.
-            split_tpye (Literal[str]): Select a method for data splitting.
-            seed (Optional[int]): Random seed for reproducibility.
-
-        Returns:
-            Tuple[List[str], List[str], Optional[List[str]]: Train, validation, and test calibration IDs.
-        """
         random.seed(seed)  # for reproduducibility
 
         train_size = train_valid_test_sizes[0]
@@ -619,28 +549,10 @@ class CalibrationDataLoader:
 
     def __len__(self) -> int:
         #TODO: Change, ids is a dictionary.
-        """
-        Get the number of calibration points.
-
-        Returns:
-            int: Number of calibration points
-        """
         return len(self.calibration_ids)
 
     def __getitem__(self, idx: Union[int, str]) -> Dict[str, Any]:
-        """
-        Get a single calibration data point.
 
-        Args:
-            idx (Union[int, str]): Either an integer index or a calibration ID string
-
-        Returns:
-            Dict: A dictionary containing the data for the requested calibration point
-
-        Raises:
-            KeyError: If the requested calibration ID is not available
-            IndexError: If the index is out of range
-        """
         if isinstance(idx, str):
             return self.get_single_item(idx)
         elif isinstance(idx, int):

@@ -27,6 +27,44 @@ def get_rigid_body_kinematic_parameters_from_scenario(
     
     return parameters_dict
 
+def calculate_intersection(ray_origin: torch.Tensor, 
+                           ray_direction: torch.Tensor, 
+                           plane_center: torch.Tensor, 
+                           plane_normal: torch.Tensor):
+    """
+    Calculate the intersection point of a batch of rays with a plane.
+    
+    All inputs must be given in ENU-coordinates. 
+    
+    Args:
+        ray_origin (torch.Tensor): The point of origin of the ray (reflection point) [B, 4]
+        ray_direction (torch.Tensor): The direction of the ray (normalized) [B, 4]
+        plane_center (torch.Tensor): A point on the plane (center point) [B, 4]
+        plane_normal (torch.Tensor): Normal vector of the plane (normalized) [B, 4]
+        
+    Returns:
+        torch.Tensor: Intersection point in ENU-coordinates [B, 4]
+        torch.Tensor: Distance from ray_origin to intersection point in meter [B, 4]
+    """
+    
+    # Normalize vectors if they aren't already
+    ray_direction = ray_direction / torch.norm(ray_direction, dim=-1, keepdim=True)
+    plane_normal = plane_normal / torch.norm(plane_normal, dim=-1, keepdim=True)
+    
+    # Calculate the vector from ray origin to plane center
+    ray_to_plane = plane_center - ray_origin
+    
+    # Calculate the denominator (dot product of ray direction and plane normal)
+    denominator = torch.sum(ray_direction * plane_normal, dim=-1, keepdim=True)
+    
+    # Calculate the distance along the ray to the intersection point
+    # t = (ray_to_plane • plane_normal) / (ray_direction • plane_normal)
+    t = torch.sum(ray_to_plane * plane_normal, dim=-1, keepdim=True) / denominator
+    
+    # Calculate the intersection point
+    intersection_point = ray_origin + t * ray_direction
+    
+    return intersection_point, t
 
 def check_for_nan_grad(obj, name=None, index=None):
     """
@@ -81,6 +119,84 @@ def count_parameters(obj):
     # Not a parameter or container
     return 0, 0
 
+def create_parameter_groups(all_heliostats_params, num_heliostats):
+  
+    # Group by heliostat
+    param_groups = []
+    
+    for i in range(num_heliostats):
+        # 2a) Translational parameters for this heliostat
+        param_groups.append({
+            'params': [
+                all_heliostats_params['heliostat_e'][i],
+                all_heliostats_params['heliostat_n'][i],
+                all_heliostats_params['heliostat_u'][i],
+                all_heliostats_params['first_joint_translation_e'][i],
+                all_heliostats_params['first_joint_translation_n'][i],
+                all_heliostats_params['first_joint_translation_u'][i],
+                all_heliostats_params['second_joint_translation_e'][i],
+                all_heliostats_params['second_joint_translation_n'][i],
+                all_heliostats_params['second_joint_translation_u'][i],
+                # all_heliostats_params['concentrator_translation_e'][i],
+                # all_heliostats_params['concentrator_translation_n'][i],
+                # all_heliostats_params['concentrator_translation_u'][i]
+            ],
+            'lr': 5e-3,
+            'name': f'heliostat_{i}_translational'
+        })
+        
+        # 2b) Rotational parameters for this heliostat
+        param_groups.append({
+            'params': [
+                all_heliostats_params['first_joint_tilt_n'][i],
+                all_heliostats_params['first_joint_tilt_u'][i],
+                all_heliostats_params['second_joint_tilt_e'][i],
+                all_heliostats_params['second_joint_tilt_n'][i],
+                all_heliostats_params['concentrator_tilt_e'][i],
+                all_heliostats_params['concentrator_tilt_n'][i],
+                all_heliostats_params['concentrator_tilt_u'][i]
+            ],
+            'lr': 5e-4,
+            'name': f'heliostat_{i}_rotational'
+        })
+        
+        for j in range(len(all_heliostats_params['actuators_increments'][i])):
+            # 2c) Increments
+            param_groups.append({
+                'params': [all_heliostats_params['actuators_increments'][i][j]],
+                'lr': 5e-2,
+                'name': f'heliostat_{i}_actuator_{j}_increments'
+            })
+            
+            # 2d) Stroke lengths
+            param_groups.append({
+                'params': [all_heliostats_params['actuators_initial_stroke_lengths'][i][j]],
+                'lr': 1e-4,
+                'name': f'heliostat_{i}_actuator_{j}_strokes'
+            })
+            
+            # 2e) Offsets
+            param_groups.append({
+                'params': [all_heliostats_params['actuators_offsets'][i][j]],
+                'lr': 1e-4,
+                'name': f'heliostat_{i}_actuator_{j}_offsets'
+            })
+            
+            # 2f) Pivot radii
+            param_groups.append({
+                'params': [all_heliostats_params['actuators_pivot_radii'][i][j]],
+                'lr': 1e-4,
+                'name': f'heliostat_{i}_actuator_{j}_radii'
+            })
+            
+            # 2g) Initial angles
+            param_groups.append({
+                'params': [all_heliostats_params['actuators_initial_angles'][i][j]],
+                'lr': 1e-4,
+                'name': f'heliostat_{i}_actuator_{j}_angles'
+            })
+    
+    return param_groups
 
 # def get_rigid_body_kinematic_parameters_from_scenario(
 #     kinematic: RigidBody,

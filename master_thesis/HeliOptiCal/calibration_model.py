@@ -24,9 +24,8 @@ from artist.raytracing.heliostat_tracing import HeliostatRayTracer
 from artist.util import utils
 
 from calibration_dataset import CalibrationDataLoader
-from util import get_rigid_body_kinematic_parameters_from_scenario
+from util import get_rigid_body_kinematic_parameters_from_scenario, count_parameters, check_for_nan_grad, create_parameter_groups
 from image_loss import chamfer_distance_batch_optimized, chamfer_distance_batch, contour_difference
-
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
@@ -102,8 +101,8 @@ class CalibrationModel(nn.Module):
                 kinematic=self.heliostat_field.rigid_body_kinematic
             )
         )
-        total_parameters = sum(param.numel() for param in self.learnable_parameters.values())
-        log.info(f"Total number of parameters: {total_parameters}")
+        total_parameters, total_elements = count_parameters(self.learnable_parameters)
+        log.info(f"Total number of parameters and elements: {total_parameters}, {total_elements}")
 
         self.optimizer, self.scheduler = self.setup_optimizer(optimizer=model_config['optimizer_type'],
                                                               scheduler=model_config['scheduler_type'],
@@ -111,7 +110,7 @@ class CalibrationModel(nn.Module):
                                                               initial_lr=model_config['init_learning_rate'],
                                                               )
 
-        self.writer = SummaryWriter(log_dir=f'/dss/dsshome1/05/di38kid/data/results/tensorboard/{self.name}')
+        self.writer = SummaryWriter(log_dir=f'/dss/dsshome1/05/di38kid/data/results/runs/{self.name}/log')
         # self.writer = summary.create_file_writer('tensorboard/' + self.name)
         self.loss_type = None
 
@@ -119,7 +118,7 @@ class CalibrationModel(nn.Module):
             self,
             optimizer: Literal['Adam'] = 'Adam',
             scheduler: Literal['ReduceLROnPlateau', 'CyclicLR'] = 'ReduceLROnPlateau',
-            param_groups: List[List[str]] = None,
+            param_groups: List[List[str]] = [],
             initial_lr: Union[float, List] = 0.00001,
             lr_factor: float = 0.1,
             lr_patience: int = 10,
@@ -128,10 +127,30 @@ class CalibrationModel(nn.Module):
     ):
         optimizer_kwargs = []
         scheduler_kwargs = {'base_lr': None, 'max_lr': None}
+        param_groups = create_parameter_groups(self.learnable_parameters, num_heliostats=self.heliostat_field.number_of_heliostats)
+        self.optimizer = torch.optim.Adam(
+            param_groups,
+        )
+        base_lrs = [group['lr'] for group in param_groups]
+        # Define max learning rates (e.g., 10x the base rate)
+        max_lrs = [base_lr * 10 for base_lr in base_lrs]
+
+        # Create cyclic learning rate scheduler
+        ''' self.scheduler = torch.optim.lr_scheduler.CyclicLR(
+            self.optimizer,
+            base_lr=base_lrs,  # List of base LRs for each parameter group
+            max_lr=max_lrs,    # List of max LRs for each parameter group
+            step_size_up=500,  # Steps in the increasing phase
+            mode='triangular2',  # Learning rate policy
+            cycle_momentum=False  # Don't cycle momentum when using Adam/AdamW
+        ) '''
+        
+        ''' if len(param_groups) == 0:
+            optimizer_kwargs.append({'params': self.learnable_parameters.parameters(), 'lr': initial_lr[0]}) 
         if isinstance(optimizer, str):
             if optimizer == 'Adam':
                 if param_groups is None:
-                    optimizer_kwargs.append({'params': self.learnable_parameters.values(), 'lr': initial_lr[0]})
+                    optimizer_kwargs.append({'params': self.learnable_parameters.parameters(), 'lr': initial_lr[0]})
                     scheduler_kwargs['base_lr'] = initial_lr[0] / 10
                     scheduler_kwargs['max_lr'] = initial_lr[0]
                 else:
@@ -141,10 +160,14 @@ class CalibrationModel(nn.Module):
                     scheduler_kwargs['base_lr'] = [lr / 10 for lr in initial_lr]
                     scheduler_kwargs['max_lr'] = [lr for lr in initial_lr]
                 self.optimizer = torch.optim.Adam(optimizer_kwargs)
+            elif optimizer == 'AdamW':
+                self.optimiizer = torch.optim.AdamW()
             else:
-                raise ValueError(f"Optimizer {optimizer} not included.")
+                raise ValueError(
+                    f"Optimizer name not found, change name or include new optimizer."
+                    )
         else:
-            raise ValueError(f"Optimizer must be given as str.")
+            raise ValueError(f"Optimizer must be given as str.") '''
         if scheduler is not None:
             if scheduler == 'ReduceLROnPlateau':
                 self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -169,10 +192,26 @@ class CalibrationModel(nn.Module):
                     max_momentum=0.9,
                     last_epoch=-1
                 )
+            elif scheduler == 'OneCycleLR':
+                self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    optimizer=self.optimizer,
+                    total_steps=150,
+                    max_lr=0.01,
+                    div_factor=1e-6 / 1e-10
+                )
+            elif scheduler == 'CosineAnnealingLR':
+                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer=self.optimizer,
+                    T_max=150,  # TODO: Use max epochs here
+                    eta_min=1e-6                    
+                )
+                
             else:
-                raise ValueError(f"Scheduler must be of provided as str.")
-            log.info(f"Optimizer and Scheduler setup complete.")
-            return self.optimizer, self.scheduler
+                raise ValueError(
+                    "Scheduler name not found, change name or implement new scheduler."
+                    )
+        log.info(f"Optimizer and Scheduler setup complete.")
+        return self.optimizer, self.scheduler
 
     def forward(
             self,
@@ -207,7 +246,9 @@ class CalibrationModel(nn.Module):
                 device=device
             )
             sample_orientations = self.heliostat_field.rigid_body_kinematic.orientations
-            target_reflection_directions[sample] = (data['flux_centers'] - sample_orientations[:, :, 3])
+            target_reflection_directions[sample] = (data['flux_centers'] - sample_orientations[:, 0:4, 3])
+            # print("Orientations: Surface origins:")
+            # print(sample_orientations[:, :, 3])
             
             incident_ray_directions = data['incident_rays']
             target_area_names = data['receiver_targets']
@@ -223,7 +264,7 @@ class CalibrationModel(nn.Module):
         
                 for n_heliostat in range(num_heliostats):
                     pred_bitmap = sample_bitmaps[n_heliostat]
-                    if pred_bitmap.sum() > 0.1:  # heliostat might miss target area
+                    if pred_bitmap.sum() > 0.0001:  # heliostat might miss target area
                         target_area = target_areas[n_heliostat]
                         
                         center_of_mass = utils.get_center_of_mass(
@@ -254,24 +295,27 @@ class CalibrationModel(nn.Module):
                 
             else: # No raytracing, calculate error from orientations.
                 concentrator_normals = sample_orientations[:, 0:4, 2]
+                # print("Orientations: Surface normals")
+                # print(sample_orientations[:, 0:4, 2])
                 concentrator_normals = concentrator_normals / torch.norm(concentrator_normals, dim=1, keepdim=True)  # normalize
-                
-                pred_reflection_directions[sample, :] = raytracing_utils.reflect(
-                    - incident_ray_directions, concentrator_normals
-                )
+                for n_heliostat in range(num_heliostats):
+                    pred_reflection_directions[sample, n_heliostat] = raytracing_utils.reflect(
+                        incident_ray_directions[n_heliostat], concentrator_normals[n_heliostat]
+                    )
                 
         end = time.time()
-        print('raytracing took:', end-start)
+        # print('forward loop took:', end-start)
         
-        # rescale prediction bitmpas
-        target_bitmaps = torch.stack([sample['flux_images'] for sample in field_batch]).to(device)
-        pred_bitmaps = self.rescale_flux_bitmaps(pred_bitmaps, target_bitmaps)
-        diff_bitmaps = target_bitmaps - pred_bitmaps
-        
-        contour_bitmaps = contour_difference(predictions=pred_bitmaps, 
-                                             targets=target_bitmaps, 
-                                             threshold=0.5, 
-                                             sharpness=20.0)
+        if do_raytracing:
+            # rescale prediction bitmpas
+            target_bitmaps = torch.stack([sample['flux_images'] for sample in field_batch]).to(device)
+            pred_bitmaps = self.rescale_flux_bitmaps(pred_bitmaps, target_bitmaps)
+            diff_bitmaps = target_bitmaps - pred_bitmaps
+            
+            contour_bitmaps = contour_difference(predictions=pred_bitmaps, 
+                                                targets=target_bitmaps, 
+                                                threshold=0.5, 
+                                                sharpness=20.0)
         
         if do_plotting:
             import matplotlib.pyplot as plt
@@ -319,10 +363,10 @@ class CalibrationModel(nn.Module):
                 target_reflection_directions
             )
         
-        print(f"\talignment errors:")
-        for sample, field_errors in enumerate(alignment_errors.tolist()):
-            print(f'\t\t[{sample}]: {field_errors}')
-        print()
+        # print(f"\talignment errors:")
+        # for sample, field_errors in enumerate(alignment_errors.tolist()):
+        #     print(f'\t\t[{sample}]: {field_errors}')
+        # print()
         
         avg_per_heliostat = alignment_errors.mean(dim=0)
         print(f"\taverage errors: {avg_per_heliostat.tolist()}")
@@ -332,7 +376,7 @@ class CalibrationModel(nn.Module):
 
         flat_errors = alignment_errors.flatten()
         median_error = torch.median(flat_errors)
-        print(f"\tmedian over whole field: {median_error.item()}")
+        # print(f"\tmedian over whole field: {median_error.item()}")
 
         if do_raytracing:
             mae = torch.nn.L1Loss()
@@ -379,6 +423,7 @@ class CalibrationModel(nn.Module):
             # Calculate combined loss from alignment MSE and flux MSE.
             alpha = 0.8
             # loss = alpha * msae + (1 - alpha) * mspe
+            # TODO: Make alpha learnable https://github.com/Helmholtz-AI-Energy/propulate/blob/main/tutorials/nm_example.py
             loss = alpha * mean_chd + (1-alpha) * maae 
             
             self.writer.add_scalar(f"Loss/MeanCHD/{mode}", mean_chd.item(), epoch)
@@ -390,58 +435,56 @@ class CalibrationModel(nn.Module):
             self.writer.add_scalar(f"Loss/MeanCHD+MAAE/{mode}", loss.item(), epoch)
 
         else:
+            mae = torch.nn.L1Loss()
             mse = torch.nn.MSELoss()
-            loss = mse(alignment_errors, torch.zeros_like(alignment_errors))
+            loss = mae(alignment_errors, torch.zeros_like(alignment_errors))
             loss_type = 'MSE (Alignment Errors)'
 
         self.writer.add_scalar(f"AlignmentErrors_mrad/{mode}/Average", avg_of_field.item(), epoch)
         self.writer.add_scalar(f"AlignmentErrors_mrad/{mode}/Median", median_error.item(), epoch)
         
-        time_chd = 0
         for n_heliostat, (heliostat_id, calib_ids) in enumerate(heliostats_and_calib_ids.items()):
-            self.writer.add_scalar(f"AlignmentErrors_mrad/{mode}/{heliostat_id}/Avg",
+            self.writer.add_scalar(f"AlignmentErrors_mrad/Avg/{mode}/{heliostat_id}",
                                    avg_per_heliostat.tolist()[n_heliostat],
                                    epoch)
             for n_sample, (calib_id, error) in enumerate(zip(calib_ids, alignment_errors[:, n_heliostat].tolist())):
                 self.writer.add_scalar(f"AlignmentErrors_mrad/{mode}/{heliostat_id}/{calib_id}", 
                                        error, 
                                        epoch)
-                self.writer.add_image(f"FluxPredictions/{mode}/{heliostat_id}/{calib_id}", 
-                                      pred_bitmaps[n_sample, n_heliostat, :, :].cpu().detach(), 
-                                      epoch, 
-                                      dataformats='HW')
-                if epoch == 1:
-                    self.writer.add_image(f"FluxGroundtruths/{mode}/{heliostat_id}/{calib_id}", 
-                                        target_bitmaps[n_sample, n_heliostat, :, :].cpu().detach(), 
+                if do_raytracing:
+                    self.writer.add_image(f"FluxPredictions/{mode}/{heliostat_id}/{calib_id}", 
+                                        pred_bitmaps[n_sample, n_heliostat, :, :].cpu().detach(), 
                                         epoch, 
                                         dataformats='HW')
-                self.writer.add_image(f"FluxDiffs/{mode}/{heliostat_id}/{calib_id}", 
-                                      diff_bitmaps[n_sample, n_heliostat, :, :].cpu().detach(), 
-                                      epoch, 
-                                      dataformats='HW')
-                self.writer.add_image(f"ContourDiffs/{mode}/{heliostat_id}/{calib_id}", 
-                                      contour_bitmaps[n_sample, n_heliostat, :, :].cpu().detach(), 
-                                      epoch, 
-                                      dataformats='HW')
-                ssim = ssim_fnc(pred_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0).unsqueeze(0),
-                                target_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0).unsqueeze(0))
-                self.writer.add_scalar(f"SSIM/{mode}/{heliostat_id}/{calib_id}", 
-                                       ssim.item(), 
-                                       epoch)
-                mspe = mse(pred_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0).unsqueeze(0),
-                           target_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0).unsqueeze(0))
-                self.writer.add_scalar(f"MSPE/{mode}/{heliostat_id}/{calib_id}", 
-                                       mspe.mean().item(), 
-                                       epoch)
-                start = time.time()
-                chd = chamfer_distance_batch(pred_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0),
-                                             target_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0))
-                end = time.time()
-                self.writer.add_scalar(f"CHD/{mode}/{heliostat_id}/{calib_id}", 
-                                       chd.mean().item(), 
-                                       epoch)
-                time_chd += (end-start)
-        print(f'\t Calculation of Chamfer Distances took: {time_chd}')
+                    if epoch == 1:
+                        self.writer.add_image(f"FluxGroundtruths/{mode}/{heliostat_id}/{calib_id}", 
+                                            target_bitmaps[n_sample, n_heliostat, :, :].cpu().detach(), 
+                                            epoch, 
+                                            dataformats='HW')
+                    self.writer.add_image(f"FluxDiffs/{mode}/{heliostat_id}/{calib_id}", 
+                                        diff_bitmaps[n_sample, n_heliostat, :, :].cpu().detach(), 
+                                        epoch, 
+                                        dataformats='HW')
+                    self.writer.add_image(f"ContourDiffs/{mode}/{heliostat_id}/{calib_id}", 
+                                        contour_bitmaps[n_sample, n_heliostat, :, :].cpu().detach(), 
+                                        epoch, 
+                                        dataformats='HW')
+                    ssim = ssim_fnc(pred_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0).unsqueeze(0),
+                                    target_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0).unsqueeze(0))
+                    self.writer.add_scalar(f"SSIM/{mode}/{heliostat_id}/{calib_id}", 
+                                        ssim.item(), 
+                                        epoch)
+                    mspe = mse(pred_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0).unsqueeze(0),
+                            target_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0).unsqueeze(0))
+                    self.writer.add_scalar(f"MSPE/{mode}/{heliostat_id}/{calib_id}", 
+                                        mspe.mean().item(), 
+                                        epoch)
+                    chd = chamfer_distance_batch(pred_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0),
+                                                target_bitmaps[n_sample, n_heliostat, :, :].unsqueeze(0))
+                    self.writer.add_scalar(f"CHD/{mode}/{heliostat_id}/{calib_id}", 
+                                        chd.mean().item(), 
+                                        epoch)
+                    
         return alignment_errors, loss
 
     @staticmethod
@@ -474,7 +517,7 @@ class CalibrationModel(nn.Module):
             tolerance: float = 0.0,
             seed: int = random_seed,
             exclude_params: List[str] = (),
-            with_raytracing: bool = True,
+            use_raytracing: bool = True,
             run_config: dict = None,
             device: Union[torch.device, str] = "cuda"
     ):
@@ -503,15 +546,15 @@ class CalibrationModel(nn.Module):
             train_alignment_errors, train_loss = self.forward(
                 mode='Train', epoch=epoch,
                 heliostats_and_calib_ids=train_dict,
-                do_raytracing=with_raytracing,
+                do_raytracing=use_raytracing,
                 do_plotting=False,
                 device=device
             )
             train_loss.backward()
-            for name, param in self.learnable_parameters.items():
-                if param.grad is not None:
-                    if torch.isnan(param.grad).any():
-                        print(f"Parameter {name} has NaN gradient")
+            # torch.nn.utils.clip_grad_norm_(self.learnable_parameters.parameters(), max_norm=0.5)            
+            
+            check_for_nan_grad(self.learnable_parameters)
+
             self.optimizer.step()
 
             self.eval()
@@ -526,7 +569,7 @@ class CalibrationModel(nn.Module):
                 valid_alignment_errors, valid_loss = self.forward(
                     mode='Validation', epoch=epoch,
                     heliostats_and_calib_ids=val_dict,
-                    do_raytracing=with_raytracing,
+                    do_raytracing=use_raytracing,
                     do_plotting=False,
                     device=device
                 )
@@ -534,6 +577,8 @@ class CalibrationModel(nn.Module):
 
             avg_train_error = train_alignment_errors.mean()
             avg_valid_error = valid_alignment_errors.mean()
+            
+            self._log_parameters(epoch=epoch)
             
             # self.writer.add_scalar("Loss/Train", train_loss.cpu().detach().numpy(), epoch)
             # self.writer.add_scalar("Loss/Valid", valid_loss.cpu().detach().numpy(), epoch)
@@ -548,16 +593,7 @@ class CalibrationModel(nn.Module):
 
             # for calib_id, error in zip(valid_ids, valid_alignment_errors):
             #     self.writer.add_scalar(f"Errors/Valid/{calib_id}", error.cpu().detach().numpy(), epoch)
-
-            for name, params in self.learnable_parameters.items():
-                params = params.tolist()
-                if torch.isnan(param).any():
-                    print(f"Parameter {name} is NaN.")
-                    for n_heliostat, heliostat_name in enumerate(self.heliostat_field.all_heliostat_names):
-                        self.writer.add_histogram(f'ParameterGroups/{heliostat_name}/{name}', 
-                                                  param[n_heliostat].numpy(), 
-                                                  epoch)
-
+                      
             # TODO: Log Raytracer Flux Bitmaps to Tensorboard.
             # summary.image("FluxBitmaps/id", flux_bitmap, epoch)
 
@@ -568,7 +604,8 @@ class CalibrationModel(nn.Module):
                 log.info(f"Epoch: {epoch} of {num_epochs} max, "
                          f"Train / Valid Loss: {train_loss.item():.4f} / {valid_loss.item():.4f}, "
                          f"Avg Train / Valid Error (mrad): {avg_train_error.item():.2f} / {avg_valid_error.item():.2f}, "
-                         f"LR: {self.scheduler.get_last_lr()}")
+                         # f"LR: {self.scheduler.get_last_lr()}"
+                         )
 
             epoch += 1
         
@@ -606,6 +643,32 @@ class CalibrationModel(nn.Module):
             log.info(f"Test Loss: {test_loss.item():.4f}, "
                      f"Avg Test Error (mrad): {avg_test_error.item():.2f}")
 
+    def _log_parameters(self, epoch, obj=None, name=None, heliostat_idx=None, index=None):
+        if obj is None:
+            obj = self.learnable_parameters
+            
+        if isinstance(obj, torch.nn.Parameter):
+            self.writer.add_histogram(f"Parameters/{name}/{self.heliostat_field.all_heliostat_names[heliostat_idx]}",
+                                        obj.cpu().detach().numpy(),
+                                        epoch)
+            
+        if isinstance(obj, (torch.nn.ParameterList, list, tuple)):
+            if heliostat_idx is None:
+                if len(obj) == len(self.heliostat_field.all_heliostat_names):
+                    for h, param in enumerate(obj):
+                        self._log_parameters(epoch=epoch, obj=param, name=name, heliostat_idx=h)
+                else:
+                    for i, param in enumerate(obj):
+                        self._log_parameters(epoch=epoch, obj=param, name=name, heliostat_idx=h, index=i)
+                
+            else: 
+                [self._log_parameters(epoch=epoch, obj=param, name=name, heliostat_idx=heliostat_idx, index=i) 
+                 for i, param in enumerate(obj)]
+
+        if isinstance(obj, (torch.nn.ParameterDict, dict)):
+            for name, obj in obj.items():
+                self._log_parameters(epoch=epoch, obj=obj, name=name)
+    
     @staticmethod
     def rescale_flux_bitmaps(
         predictions: torch.Tensor,
@@ -624,6 +687,7 @@ class CalibrationModel(nn.Module):
         scaling_factors[non_zero_mask] = target_energy[non_zero_mask] / pred_energy[non_zero_mask]
         
         return predictions * scaling_factors
+    
     
     # TODO: Include Learning Rate finder.
     # def find_lr(
