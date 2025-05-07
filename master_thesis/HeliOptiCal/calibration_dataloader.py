@@ -29,19 +29,18 @@ logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] - [%(name)s] - 
 # A logger for the calibration dataset.
 
 class CalibrationDataLoader:
-    # TODO: complete documentation
     """
     A class for managing heliostat calibration data.
 
-    Attributes 
-    ----------
-
     Methods
     -------
-    
+    __init__(...)
+        Initializes the loader and loads calibration metadata and optionally flux images.
+    load_properties_from_file(properties_file, device=None)
+        Extracts and returns data from a single calibration JSON file
+    get_field_batch(helio_and_calib_ids=None, device=None)
+        Constructs a batch of field-level data samples for simulation or inference tasks.
     """
-    
-    # TODO: Make CalibrationDataLoader a subclass of Dataset and implement __getitem__ and __len__ methods.
     def __init__(
             self,
             data_directory: Union[str, Path],
