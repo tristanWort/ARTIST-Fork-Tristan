@@ -106,7 +106,7 @@ class CalibrationDataLoader:
         calibration_directories = {}
         for heliostat_id in self.heliostats_to_load: 
             calibration_directory = (Path(self.data_dir) /
-                                    f'{heliostat_id}')
+                                    f'{heliostat_id}/Calibration')
             if not os.path.exists(calibration_directory):
                 raise FileNotFoundError(f"Calibration folder not found at path: "
                                         f"{calibration_directory}")
@@ -152,10 +152,10 @@ class CalibrationDataLoader:
                             sun_position,
                             motor_positions,
                         ) = extract_paint_calibration_data(
-                            calibration_properties_path=Path(properties_file),
+                            calibration_properties_paths=[Path(properties_file)],
                             power_plant_position=self.power_plant_position,
-                            coord_system='local_enu',
-                            has_ideal_flux_center=False,
+                            # coord_system='wgs84',
+                            # has_ideal_flux_center=False,
                             device=self.device
                         )
                 except KeyError:
@@ -165,10 +165,10 @@ class CalibrationDataLoader:
                 self.calibration_ids[heliostat_id].append(calibration_id)
                 self.sun_azimuths[calibration_id] = calibration_data['sun_azimuth']
                 self.sun_elevations[calibration_id] = calibration_data['sun_elevation']
-                self.flux_centers[calibration_id] = spot_center.to(self.device)
-                self.motor_positions[calibration_id] = motor_positions.to(self.device)
-                self.incident_rays[calibration_id] = torch.tensor([0.0, 0.0, 0.0, 1.0]).to(self.device) - sun_position.to(self.device)
-                self.receiver_targets[calibration_id] = calibration_target_name
+                self.flux_centers[calibration_id] = spot_center[0].to(self.device)
+                self.motor_positions[calibration_id] = motor_positions[0].to(self.device)
+                self.incident_rays[calibration_id] = torch.tensor([0.0, 0.0, 0.0, 1.0]).to(self.device) - sun_position[0].to(self.device)
+                self.receiver_targets[calibration_id] = calibration_target_name[0]
         
 
                 if self.load_flux_images:
