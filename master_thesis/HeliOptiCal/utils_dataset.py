@@ -5,7 +5,7 @@ from typing import Union, Literal, Dict, List
 
 from artist.util import config_dictionary, utils
 
-import config_extended
+import my_config_dict
 
 
 def extract_paint_calibration_data(calibration_properties_path: Union[str, Path],
@@ -51,7 +51,7 @@ def extract_paint_calibration_data(calibration_properties_path: Union[str, Path]
     
     if already_in_enu_4d: 
         center_calibration_image = torch.tensor(
-            calibration_dict[config_extended.focal_spot_enu_4d],
+            calibration_dict[my_config_dict.focal_spot_enu_4d],
             dtype=torch.float64,
             device=device
             )
