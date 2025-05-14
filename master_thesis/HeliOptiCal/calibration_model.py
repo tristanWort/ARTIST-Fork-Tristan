@@ -80,6 +80,7 @@ class CalibrationModel(nn.Module):
         
         # Load the scenario
         self.scenario, self.target_areas = self.load_scenario(general_config[my_config_dict.general_scenario_path])
+        self.heliostat_ids = self.scenario.heliostat_field.all_heliostat_names
         
         # Initiate Raytracer
         self.use_raytracing = bool(general_config[my_config_dict.general_use_raytracing])
@@ -88,10 +89,8 @@ class CalibrationModel(nn.Module):
         
         # Perform configurations for model
         model_config = run_config[my_config_dict.run_config_model]
-        self.learnable_params_dict, parameter_count, element_count = (
-            get_rigid_body_kinematic_parameters_from_scenario(
-                kinematic=self.scenario.heliostat_field.rigid_body_kinematic
-                ))
+        self.learnable_params_dict, parameter_count, element_count = (get_rigid_body_kinematic_parameters_from_scenario(
+                kinematic=self.scenario.heliostat_field.rigid_body_kinematic))
         log.info(f"Found number of parameters and elements: {parameter_count}, {element_count}")
         
         self.optimizer = self.configure_optimizer(model_config)
@@ -117,7 +116,17 @@ class CalibrationModel(nn.Module):
                 scenario_file=scenario_file, 
                 device=self.device
             )
-            
+
+        # Add errors to kinematic model
+        if bool(self.run_config[my_config_dict.run_config_general][my_config_dict.general_introduce_random_errors]):
+            from add_random_errors import add_random_errors_to_kinematic
+            error_config = self.run_config[my_config_dict.run_config_initial_errors]
+            seed = self.run_config[my_config_dict.run_config_general][my_config_dict.general_random_seed]            
+            error_kinematic = add_random_errors_to_kinematic(error_config, loaded_scenario, self.save_directory/'errors',
+                                           seed=seed, device=self.device)
+            loaded_scenario.heliostat_field.rigid_body_kinematic = error_kinematic
+            log.info("Added initial errors to Heliostat field kinematic.")
+
         target_areas = {area.name: area for area in loaded_scenario.target_areas.target_area_list}
         return loaded_scenario, target_areas
     
@@ -334,9 +343,9 @@ class CalibrationModel(nn.Module):
         # Configure dataloader
         calibration_data_loader = CalibrationDataLoader(
             data_directory=dataset_config[my_config_dict.dataset_training_data_directory],
-            heliostats_to_load=self.scenario.heliostat_field.all_heliostat_names,
+            heliostats_to_load=self.heliostat_ids,
             power_plant_position=self.scenario.power_plant_position,
-            load_flux_images=bool(self.use_raytracing),
+            load_flux_images=True, #bool(self.use_raytracing),
             preload_flux_images=bool(dataset_config[my_config_dict.dataset_preload_flux_images]),
             is_simulated_data=bool(dataset_config[my_config_dict.dataset_training_data_was_simulated]),
             properties_file_ends_with=dataset_config[my_config_dict.dataset_properties_suffix],
@@ -374,7 +383,7 @@ class CalibrationModel(nn.Module):
                 incident_ray_directions = data[my_config_dict.field_sample_incident_rays]
                 target_area_names = data[my_config_dict.field_sample_target_names]
                 target_areas = [self.target_areas[name] for name in target_area_names]
-                sample_flux_bitmaps = raytracer.trace_rays_separate(incident_ray_directions=incident_ray_directions,
+                pred_flux_bitmaps[sample] = raytracer.trace_rays_separate(incident_ray_directions=incident_ray_directions,
                                                                     target_areas=target_areas,
                                                                     device=device)
                 
@@ -505,7 +514,7 @@ class CalibrationModel(nn.Module):
                 "pred_flux_centers and orientations must have equal batch sizes and number of Heliostat."
     
     @staticmethod
-    def extract_upper_contours(bitmaps: torch.Tensor, threshold=0.5, sharpness=20.0, num_interpolate=0):
+    def extract_upper_contours(bitmaps: torch.Tensor, threshold=0.5, sharpness=30.0, num_interpolate=0):
         """
         
         """
@@ -522,10 +531,11 @@ class CalibrationModel(nn.Module):
         # Get nested list of target area names and stacked Tensor of incident ray directions from batch data
         target_areas = [sample[my_config_dict.field_sample_target_names] for sample in field_batch]
         incident_ray_directions = torch.stack([sample[my_config_dict.field_sample_incident_rays] for sample in field_batch])
-        true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] for sample in field_batch])
+        # true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] for sample in field_batch])
         
-        # true_flux_bitmaps = torch.stack([sample[my_config_dict.field_sample_flux_images] for sample in field_batch])
-        # true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas)
+        true_flux_bitmaps = torch.stack([sample[my_config_dict.field_sample_flux_images] for sample in field_batch])
+        with torch.no_grad():
+            true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas)
         
         # All inputs must have the same batch size
         assert len(target_areas) == orientations.shape[0] == pred_flux_bitmaps.shape[0],\
@@ -537,8 +547,8 @@ class CalibrationModel(nn.Module):
         
         # Mask for empty bitmaps
         if self.use_raytracing:
-            true_flux_bitmaps = torch.stack([sample[my_config_dict.field_sample_flux_images] for sample in field_batch])
-            empty_mask = (pred_flux_bitmaps.sum(dim=[-1, -2]) < 0.0001)  # [B, H]
+            sums = pred_flux_bitmaps.sum(dim=[-1, -2])
+            empty_mask = (sums < 0.001)  # [B, H]
             empty_count = empty_mask.sum().item()
             self.tb_logger.log_metric(epoch, "EmptyPredFluxCount", empty_count)
             if empty_count > 0:
@@ -564,8 +574,8 @@ class CalibrationModel(nn.Module):
             
             elif "contour" in mode:               
                 # Extracts upper contour bitmaps of both the true and predicted flux images
-                true_contour_bitmaps = self.extract_upper_contours(bitmaps=true_flux_bitmaps, threshold=0.5, num_interpolate=0)
-                pred_contour_bitmaps = self.extract_upper_contours(bitmaps=pred_flux_bitmaps, threshold=0.7, num_interpolate=4)
+                true_contour_bitmaps = self.extract_upper_contours(bitmaps=true_flux_bitmaps, threshold=0.5, num_interpolate=4)
+                pred_contour_bitmaps = self.extract_upper_contours(bitmaps=pred_flux_bitmaps, threshold=0.5, num_interpolate=4)
                 
                 diff_contour_bitmaps = pred_contour_bitmaps - true_contour_bitmaps
                 self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=true_contour_bitmaps, type='TrueContour')
@@ -596,7 +606,8 @@ class CalibrationModel(nn.Module):
                 true_flux_centers = torch.stack([sample[my_config_dict.field_sample_ideal_flux_centers] for sample in field_batch])
                 
             else:  # use measured centers
-                true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] for sample in field_batch])
+                # true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] for sample in field_batch])
+                true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas)
             
             true_reflection_directions = self.calc_reflection_directions_from_flux_centers(flux_centers=true_flux_centers,
                                                                                             orientations=orientations)     
@@ -616,7 +627,7 @@ class CalibrationModel(nn.Module):
     def calibrate(self, device: Optional[Union[torch.device, str]] = None):
         """
         
-        """  
+        """ 
         device = torch.device(self.device if device is None else device)
         # Sum of scheduled epochs
         sum_epochs = sum(self.run_config[my_config_dict.run_config_model][my_config_dict.model_epochs_sequence])
@@ -633,7 +644,7 @@ class CalibrationModel(nn.Module):
                 # self.scenario, self.target_areas = self.load_scenario(self.run_config[my_config_dict.run_config_general][my_config_dict.general_scenario_path])
                 # self.learnable_params_dict, _, _ = get_rigid_body_kinematic_parameters_from_scenario(self.scenario.heliostat_field.rigid_body_kinematic)
                 # self.raytracer = self.init_raytraycer(self.scenario)
-                self.tb_logger = TensorboardLogger(run=run, heliostat_names=self.scenario.heliostat_field.all_heliostat_names, log_dir=self.save_directory / 'logs')
+                self.tb_logger = TensorboardLogger(run=run, heliostat_names=self.heliostat_ids, log_dir=self.save_directory / 'logs')
                 
                 # Set gradients to False for selection of frozen parameters
                 freeze_and_phase = self.run_config[my_config_dict.run_config_model][my_config_dict.model_apply_with_caution]
@@ -657,8 +668,7 @@ class CalibrationModel(nn.Module):
                     
                     # Train
                     self.train()
-                    split_ids_train = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'train',
-                                                                                           heliostat_ids=self.scenario.heliostat_field.all_heliostat_names)
+                    split_ids_train = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'train', heliostat_ids=self.heliostat_ids)
                     self.tb_logger.set_mode("Train")
                     self.tb_logger.set_helio_and_calib_ids(split_ids_train)
                     data_batch_train = self.dataloader.get_field_batch(helio_and_calib_ids=split_ids_train, device=device)
@@ -677,8 +687,7 @@ class CalibrationModel(nn.Module):
                         
                     # Validation
                     self.eval()
-                    split_ids_val = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'validation', 
-                                                                                         heliostat_ids=self.scenario.heliostat_field.all_heliostat_names)
+                    split_ids_val = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'validation', heliostat_ids=self.heliostat_ids)
                     self.tb_logger.set_mode("Valid")
                     self.tb_logger.set_helio_and_calib_ids(split_ids_val)
                     with torch.no_grad():
@@ -705,7 +714,7 @@ class CalibrationModel(nn.Module):
                     if epoch % log_steps == 0:
                         
                         log.info(f"Epoch: {epoch} of {sum_epochs}, "
-                         f"Train / Val Loss: {train_loss.item():.2f} / {val_loss.item():.2f}, "
+                         f"Train / Val Loss: {train_loss.item():.6f} / {val_loss.item():.6f}, "
                          f"Train / Val Avg.Error (mrad): {train_alignment_errors.mean().item():.2f} / {val_alignment_errors.mean().item():.2f}, "
                          f"LR: {current_lr}")
                     
@@ -718,8 +727,7 @@ class CalibrationModel(nn.Module):
                 
                 # Testing
                 self.eval()
-                split_ids_test = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'test',
-                                                                                      heliostat_ids=self.scenario.heliostat_field.all_heliostat_names)
+                split_ids_test = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'test', heliostat_ids=self.heliostat_ids)
                 self.tb_logger.set_mode("Test")
                 self.tb_logger.set_helio_and_calib_ids(split_ids_test)
                 data_batch_test = self.dataloader.get_field_batch(helio_and_calib_ids=split_ids_test, device=device)
@@ -923,12 +931,12 @@ class CalibrationModel(nn.Module):
             if isinstance(obj, torch.nn.Parameter):
                 if heliostat_idx is None:
                     raise ValueError(f"Missing Heliostat index!")
-                heliostat_name = self.scenario.heliostat_field.all_heliostat_names[heliostat_idx]
+                heliostat_name = self.heliostat_ids[heliostat_idx]
                 self.tb_logger.log_parameter_as_scalar(name, heliostat_name, obj, epoch, index)
             
             elif isinstance(obj, (torch.nn.ParameterList, List, Tuple)):
                 if heliostat_idx is None:
-                    if len(obj) == len(self.heliostat_field.all_heliostat_names):
+                    if len(obj) == len(self.heliostat_ids):
                         for h, param in enumerate(obj):
                             self.log_parameters(epoch=epoch, obj=param, name=name, heliostat_idx=h)
                     else:
@@ -950,8 +958,8 @@ class CalibrationModel(nn.Module):
 
         for n_helio, (helio_id, calib_ids) in enumerate(helio_and_calib_ids.items()):
             # Log averages of errors per Heliostat
-            avg_helio = alignment_errors[n_helio].mean()
-            med_helio = alignment_errors[n_helio].median()
+            avg_helio = alignment_errors[:, n_helio].mean()
+            med_helio = alignment_errors[:, n_helio].median()
             self.tb_logger.log_heliostat_metric(epoch, "AlignmentErrors_mrad/Avg", helio_id, avg_helio.item())
             self.tb_logger.log_heliostat_metric(epoch, "AlignmentErrors_mrad/Med", helio_id, med_helio.item())
             
