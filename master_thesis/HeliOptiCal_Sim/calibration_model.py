@@ -9,7 +9,7 @@ import os
 import copy
 
 from torchmetrics.image import StructuralSimilarityIndexMeasure
-from typing import Union, Literal, List, Tuple
+from typing import Union, Literal, List, Tuple, Dict
 from pathlib import Path
 
 # parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -100,8 +100,8 @@ class CalibrationModel(nn.Module):
                     heliostats_to_load=heliostat_ids,
                     power_plant_position=self.scenario.power_plant_position,
                     load_flux_images=self.use_raytracing,
-                    flux_file_ends_with='-simulated-flux.png',
-                    properties_file_ends_with='-simulation-properties.json',
+                    flux_file_ends_with='-flux.png',
+                    properties_file_ends_with='-properties.json',
                     ideal_flux_center=self.has_ideal_flux_centers,
                     device=device
                     )
@@ -204,6 +204,7 @@ class CalibrationModel(nn.Module):
                     optimizer=self.optimizer,
                     factor=config['lr_factor'],
                     patience=config['lr_patience'],
+                    factor=0.5,
                 )
             elif scheduler == 'CyclicLR':
                 scheduler = torch.optim.lr_scheduler.CyclicLR(
@@ -218,13 +219,7 @@ class CalibrationModel(nn.Module):
                     base_momentum=0.8,
                     max_momentum=0.9,
                 )
-            elif scheduler == 'OneCycleLR':
-                scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                    optimizer=self.optimizer,
-                    total_steps=150,
-                    max_lr=0.01,
-                    div_factor=1e-6 / 1e-10
-                )
+
             elif scheduler == 'CosineAnnealingLR':
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer=self.optimizer,
@@ -409,9 +404,9 @@ class CalibrationModel(nn.Module):
         avg_of_field = avg_per_heliostat.mean()
         flat_errors = alignment_errors.flatten()
         median_error = torch.median(flat_errors)
-        print(f"\t[{mode}]: average over whole field: {avg_of_field.item()}")
+        # print(f"\t[{mode}]: average over whole field: {avg_of_field.item()}")
         # print(f"\tmedian over whole field: {median_error.item()}")
-        print(f"\t[{mode}]: average errors: {avg_per_heliostat.tolist()}")
+        # print(f"\t[{mode}]: average errors: {avg_per_heliostat.tolist()}")
         self.tb_logger.log_metric("AlignmentErrors_mrad/Average", avg_of_field.item(), epoch)
         self.tb_logger.log_metric("AlignmentErrors_mrad/Median", median_error.item(), epoch)
 
@@ -528,7 +523,7 @@ class CalibrationModel(nn.Module):
     
     def freeze_parameters(
         self,
-        freeze_parameters: List[str]
+        freeze_parameters: List[str] = []
     ):
         # Iterate over the nested parameters and freeze / unfreeze
         # Names and parameter lists in the learnable parameters dict
@@ -536,15 +531,55 @@ class CalibrationModel(nn.Module):
             grad = True  
             # Check if the parameter group 
             if name in freeze_parameters:
-                print(f"Freezing parameters in '{name}'.") 
+                log.info(f"Freezing parameters '{name}'.") 
                 grad = False
             for params in param_group:
                 if isinstance(params, (torch.nn.ParameterList, list, tuple)):
                     for param in params:
-                        param.requires_grad = grad      
+                        param.requires_grad = grad
+                        has_grad = param.requires_grad    
                 else:
                     params.requires_grad = grad
+                    has_grad = params.requires_grad    
     
+    def phase_learning(
+        self,
+        epoch: int,
+        phase_parameter_learning: Dict[str, List]
+    ):
+        parameter_names = list(self.learnable_parameters.keys())
+        phased_param_groups = list(phase_parameter_learning.values())
+        
+        # create new list which will contain the parameters for freezing in each phase
+        phased_freeze_parameters = []
+        for groups in phased_param_groups:
+            # look up the parameters which have matching names to the given groups in each phase
+            freeze_parameters = [param for param in parameter_names if not any(group in param for group in groups)]
+            phased_freeze_parameters.append(freeze_parameters)
+        
+        # phased freezing in warm up
+        if epoch == 1:
+            self.freeze_parameters(phased_freeze_parameters[0])
+        elif epoch == 200:
+            self.freeze_parameters(phased_freeze_parameters[1])
+        elif epoch == 400:
+            self.freeze_parameters(phased_freeze_parameters[2])
+        elif epoch == 600:
+            self.freeze_parameters([])  # unfreeze for last 400 epochs of warm up
+
+        # phased freezing for cyclic LR
+        elif epoch >= 1000:
+            self.freeze_parameters([])
+            # phased learning of 50 epochs per parameter group
+            if epoch in [1000 + i * 150 for i in range(4)]:
+                self.freeze_parameters(phased_freeze_parameters[0])
+            elif epoch in [1050 + i * 150 for i in range(4)]:
+                self.freeze_parameters(phased_freeze_parameters[1])
+            elif epoch in [1100 + i * 150 for i in range(4)]:
+                self.freeze_parameters(phased_freeze_parameters[2])
+                
+            elif epoch >= 1600:
+                self.freeze_parameters([])  # unfreeze all for the last 1250 epochs
     
     def calibrate(
             self,
@@ -556,31 +591,22 @@ class CalibrationModel(nn.Module):
             tolerance: float = 0.0,
             seed: int = random_seed,
             freeze_parameters: List[str] = (),
+            phase_parameter_learning: Dict[str, List] = {},
             run_config: dict = None,
             device: Union[torch.device, str] = "cuda"
     ):
 
         split_df = self.calibration_data_loader.splits[split_type][split_sizes]
         
-        for name, param_group in self.learnable_parameters.items():
-            if name in freeze_parameters:
-                for params in param_group:
-                    if isinstance(params, (torch.nn.ParameterList, list, tuple)):
-                        for param in params:
-                            if isinstance(param, (torch.nn.ParameterList, list, tuple)):
-                                for p in param:
-                                    p.requires_grad = False
-                            else:
-                                param.requires_grad = False
-                                
-                    else:
-                        params.requires_grad = False
-                print(f"Parameters '{name}' have been frozen")
+        self.freeze_parameters(freeze_parameters)
 
         log.info(f"Starting Calibration with motor positions...")
         epoch = 1
         avg_valid_error = torch.inf
         while epoch <= num_epochs and avg_valid_error > tolerance:
+            
+            if len(phase_parameter_learning) > 0:
+                self.phase_learning(epoch, phase_parameter_learning)
 
             self.train()
             self.optimizer.zero_grad()
