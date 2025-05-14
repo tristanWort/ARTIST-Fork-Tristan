@@ -185,11 +185,17 @@ class CalibrationDataSplitter:
             current_split_data = {}
             for training_size in training_sizes:
                 for validation_size in validation_sizes:
-                    split_df = self.splitter.get_dataset_splits(
-                        split_type=split_type,
-                        training_size=training_size,
-                        validation_size=validation_size
-                    )
+                    if split_type == my_config_dict.RANDOM_SPLIT:
+                        split_df = self.get_random_split(
+                            training_size=training_size,
+                            validation_size=validation_size
+                        )
+                    else:
+                        split_df = self.splitter.get_dataset_splits(
+                            split_type=split_type,
+                            training_size=training_size,
+                            validation_size=validation_size
+                        )
                     current_split_data[(training_size, validation_size)] = split_df
                     splits[split_type][(training_size, validation_size)] = split_df
 
@@ -202,7 +208,50 @@ class CalibrationDataSplitter:
                 )
 
         self.splits = splits
-        
+    
+    def get_random_split(self, training_size: int, validation_size: int):
+        """
+        Split dataset randomly and return Dataframe with train, validation and test splits.
+        Each Heliostat's calibration data is randomly sampled for training size and validation size. The remaining data
+        will be the test split.
+        """
+        log.info("Preparing random split... \n" \
+                 f"Training size: {training_size}, validation size: {validation_size}, and test size > {validation_size}")
+        # Ensure 'Id' is the index
+        calibration_data = self.calibration_data.set_index(mappings.ID_INDEX, drop=True)
+        heliostat_ids = calibration_data[mappings.HELIOSTAT_ID].unique()
+
+        split_dataframes = []
+        min_images_required = training_size + validation_size
+
+        for helio_id in heliostat_ids:
+            helio_data = calibration_data[calibration_data[mappings.HELIOSTAT_ID] == helio_id].copy()
+            
+            if len(helio_data) < min_images_required:
+                log.info(f"Heliostat {helio_id} has less than the required calibration data and will be skipped.")
+                continue  # skip if not enough samples
+
+            sampled = helio_data.sample(
+                n=len(helio_data),
+                random_state=42  # for reproducibility
+            )
+            indices = sampled.index.tolist()
+
+            train_idx = indices[:training_size]
+            val_idx = indices[training_size:training_size + validation_size]
+            test_idx = indices[training_size + validation_size:]
+
+            helio_data.loc[train_idx, mappings.SPLIT_KEY] = mappings.TRAIN_INDEX
+            helio_data.loc[val_idx, mappings.SPLIT_KEY] = mappings.VALIDATION_INDEX
+            helio_data.loc[test_idx, mappings.SPLIT_KEY] = mappings.TEST_INDEX
+
+            split_dataframes.append(helio_data.loc[train_idx + val_idx + test_idx])
+
+        if not split_dataframes:
+            raise ValueError("No valid heliostats found for random split. Reduce split sizes.")
+
+        return pd.concat(split_dataframes).sort_index()
+    
     def get_helio_and_calib_ids_from_split(self, 
                                            split_type: Literal['azimuth', 'solstice', 'kmeans', 'knn'], 
                                            split_size: Tuple[int],
