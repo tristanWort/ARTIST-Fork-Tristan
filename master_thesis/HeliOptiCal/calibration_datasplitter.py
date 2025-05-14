@@ -13,7 +13,7 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import paint.util.paint_mappings as mappings
 from paint.data.dataset_splits import DatasetSplitter
 
-import config_extended
+import my_config_dict
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
@@ -80,10 +80,10 @@ class CalibrationDataSplitter:
         plt.legend()
         plt.tight_layout()
 
-        filename = self.output_directory / f"heliostat_{heliostat_id}_split_{split_type}_train{training_size}_val{validation_size}.png"
-        plt.savefig(filename, dpi=200)
+        file_path = self.output_directory / f"heliostat_{heliostat_id}_split_{split_type}_train{training_size}_val{validation_size}.png"
+        plt.savefig(file_path, dpi=200)
         plt.close()
-        log.info(f"Saved scatter plot for Heliostat {heliostat_id} to {filename}")
+        log.info(f"Saved scatter plot for Heliostat {heliostat_id} as {file_path.name}.")
 
     def plot_sun_positions_splits(self,
                                    split_type: str,
@@ -161,10 +161,10 @@ class CalibrationDataSplitter:
         axes[0].legend(handles=legend_handles, loc="upper left", fontsize=10)
 
         plt.tight_layout()
-        file_name = self.output_directory / f"{split_type}_all_splits.png"
-        plt.savefig(file_name, dpi=300)
+        file_path = self.output_directory / f"{split_type}_all_splits.png"
+        plt.savefig(file_path, dpi=300)
         plt.close(fig)
-        log.info(f"Saved bar plots for split type '{split_type}' to {file_name}")
+        log.info(f"Saved bar plots for split type '{split_type}' as {file_path.name}")
 
     def perform_splits(self,
                        training_sizes: List[int] = (15, 30, 50),
@@ -206,7 +206,7 @@ class CalibrationDataSplitter:
     def get_helio_and_calib_ids_from_split(self, 
                                            split_type: Literal['azimuth', 'solstice', 'kmeans', 'knn'], 
                                            split_size: Tuple[int],
-                                           split: Literal['train', 'validaton', 'test'],
+                                           split: Literal['train', 'validaton', 'test'] = None,
                                            heliostat_ids: Optional[List[str]] = None):
         """
         Retrieve a specific split and return the Heliostat and calibration IDs.
@@ -238,7 +238,8 @@ class CalibrationDataSplitter:
             raise ValueError(f"No splits found for split size {split_size}.")
         
         split_df = self.splits[split_type][split_size]
-        split_df = split_df[split_df['Split'] == split]
+        if split is not None:
+            split_df = split_df[split_df['Split'] == split]
         
         # If no Heliostat IDs were specified, load data for all Heliostats. 
         if heliostat_ids is None:
