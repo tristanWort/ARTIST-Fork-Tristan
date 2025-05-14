@@ -21,7 +21,7 @@ import paint.util.paint_mappings as mappings
 from paint.data.dataset_splits import DatasetSplitter
 
 import utils_dataset
-import config_extended
+import my_config_dict
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
@@ -120,12 +120,6 @@ class CalibrationDataLoader:
         
         already_in_enu_4d = False  # ``PAINT`` data will be in wg84 coordinates
         
-        if self.is_simulated_data:
-            # Simulated data will be in ENU 4D already
-            already_in_enu_4d = True
-            # And will contain ideal flux center
-            load_ideal_flux_center = True
-        
         # Extract calibration ID from digits in file name
         calibration_id = int(''.join(filter(str.isdigit, Path(properties_file).name)))
         
@@ -205,7 +199,7 @@ class CalibrationDataLoader:
                     calibration_dict = json.load(f)
                 
                 ideal_flux_center = torch.tensor(
-                    calibration_dict[config_extended.ideal_focal_spot_enu_4d],
+                    calibration_dict[my_config_dict.ideal_focal_spot_enu_4d],
                     dtype=torch.float64,
                     device=device,
                 )
@@ -229,7 +223,7 @@ class CalibrationDataLoader:
             if torch.isnan(flux_center).any():
                 nan_flux_centers.append(calibration_id)
         
-        log.info(f"Found {len(properties_files)} calibration properties files.")
+        log.info(f"{heliostat_id}: Found {len(properties_files)} calibration properties files.")
         if len(nan_flux_centers) > 0:
             log.warning(f"However, some have invalid flux centers {nan_flux_centers}")
             self.corrupt_data_ids[heliostat_id] = set(nan_flux_centers)
@@ -242,7 +236,14 @@ class CalibrationDataLoader:
         device = torch.device(self.device if device is None else device)
         
         flux_image = Image.open(flux_image_path)
-        flux_image = (transforms.ToTensor()(flux_image)).squeeze(0)
+        
+        transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((256, 256)),
+            transforms.ToTensor()  # if you want it as a PyTorch tensor
+        ])
+        flux_image = transform(flux_image).squeeze(0)
+        
         return flux_image
     
     def _load_flux_images_for_heliostat(self, heliostat_id: str):
@@ -365,18 +366,18 @@ class CalibrationDataLoader:
             sample_receiver_targets = [self.receiver_targets[id] for id in sample_ids]
 
             sample_data = {
-                config_extended.field_sample_calibration_ids: sample_ids,
-                config_extended.field_sample_sun_azimuths: [self.sun_azimuths[id] for id in sample_ids],
-                config_extended.field_sample_sun_elevations: [self.sun_elevations[id] for id in sample_ids],
-                config_extended.field_sample_flux_centers: sample_flux_centers,
-                config_extended.field_sample_motor_positions: sample_motor_positions,
-                config_extended.field_sample_incident_rays: sample_incident_rays,
-                config_extended.field_sample_target_names: sample_receiver_targets
+                my_config_dict.field_sample_calibration_ids: sample_ids,
+                my_config_dict.field_sample_sun_azimuths: [self.sun_azimuths[id] for id in sample_ids],
+                my_config_dict.field_sample_sun_elevations: [self.sun_elevations[id] for id in sample_ids],
+                my_config_dict.field_sample_flux_centers: sample_flux_centers,
+                my_config_dict.field_sample_motor_positions: sample_motor_positions,
+                my_config_dict.field_sample_incident_rays: sample_incident_rays,
+                my_config_dict.field_sample_target_names: sample_receiver_targets
                 }
 
             if self.is_simulated_data:
                 sample_ideal_flux_centers = torch.stack([self.ideal_flux_centers[id] for id in sample_ids]).to(device)
-                sample_data[config_extended.field_sample_ideal_flux_centers] = sample_ideal_flux_centers
+                sample_data[my_config_dict.field_sample_ideal_flux_centers] = sample_ideal_flux_centers
             
             if self.load_flux_images:
                 if self.preload_flux_images:
@@ -384,7 +385,7 @@ class CalibrationDataLoader:
                 else:
                     sample_flux_images = torch.stack([self._load_flux_image(self.flux_file_paths[id]) for id in sample_ids]).to(device)
                     
-                sample_data[config_extended.field_sample_flux_images] = sample_flux_images
+                sample_data[my_config_dict.field_sample_flux_images] = sample_flux_images
                 
             field_batch.append(sample_data)
         return field_batch
