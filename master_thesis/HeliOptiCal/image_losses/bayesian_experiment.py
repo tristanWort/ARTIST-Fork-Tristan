@@ -21,7 +21,7 @@ from HeliOptiCal.calibration_model import CalibrationModel
 from HeliOptiCal.utils import my_config_dict
 from HeliOptiCal.data_processing.logger import TensorboardLogger
 from HeliOptiCal.utils.util import normalize_images, normalize_and_interpolate, get_bitmap_indices_from_center_coordinates
-from HeliOptiCal.image_losses.image_loss import find_soft_contour_pytorch_vertical
+from HeliOptiCal.image_losses.image_loss import find_soft_contour_pytorch_vertical, dist_loss_image_batch
 from HeliOptiCal.utils.util_simulate import gaussian_filter_2d
 from HeliOptiCal.utils.util import calculate_intersection
 from HeliOptiCal.image_losses.calibrate_per_image import save_bitmap, save_bitmap_with_center_cross, save_bitmaps_as_gif
@@ -64,9 +64,10 @@ def save_training_plots_multiple_heliostats(logs: dict, helio_idx: int, log_dir:
     if helio_idx == 0:
         alignment_loss = [log for log in logs['mse_alignment_loss']]
         contour_loss = [log for log in logs['mse_contour_loss']]
+        image_loss = [log for log in logs['mse_image_loss']]
         combined_loss = [log for log in logs['combined_loss']]
         plot_metric(alignment_loss, "MSE Alignment Loss Evolution", "Loss", f"all_mse_alignment_loss.png")
-        # plot_metric(image_loss, "MSE Image Loss Evolution", "Loss", f"all_mse_image_loss.png")
+        plot_metric(image_loss, "MSE Image Loss Evolution", "Loss", f"all_mse_image_loss.png")
         plot_metric(contour_loss, "MSE Contour Loss Evolution", "Loss", f"all_mse_contour_loss.png")
         plot_metric(combined_loss, "Combined Loss Evolution", "Loss", f"all_combined_loss.png")
 
@@ -75,11 +76,11 @@ def save_training_plots_multiple_heliostats(logs: dict, helio_idx: int, log_dir:
     plot_metric(true_alignment_errors, "True Alignment Error Evolution", "Error [mrad]", f"all_true_errors.png")
     
 
-def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, num_interpolations, sigma_out, tolerance=10):
+def run_experiment(run_config, n_epochs, n_samples, threshold, sharpness, sigma_in, sigma_out, num_interpolations, beta, tolerance=10):
     
     # Set directory for storing outputs and saving logs.
-    directory = Path("/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/image_losses")
-    name = Path(f"run_{datetime.now().strftime('%y%m%d%H%M')}_AA39")  # for unique identification
+    directory = Path("/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/image_losses/runs")
+    name = Path(f"run_{datetime.now().strftime('%y%m%d%H%M')}_6Heliostats")  # for unique identification
     
     # Initiate a calibration model
     init_model = CalibrationModel(run_config=run_config, name=directory / name)
@@ -110,7 +111,14 @@ def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, 
     
     # save parameters
     # param_dict = {'threshold': threshold, 'sharpness': sharpness, 'sigma_in:': sigma_in, 'sigma_out': sigma_out, 'num_interpolations': int(num_interpolations)}
-    param_dict = {'threshold': threshold, 'final_sharpness': final_sharpness, 'num_interpolations': int(num_interpolations), 'sigma_out': sigma_out}
+    # param_dict = {'threshold': threshold, 'final_sharpness': final_sharpness, 'num_interpolations': int(num_interpolations), 'sigma_out': sigma_out}
+    param_dict = {'threshold': threshold, 
+                  'sharpness': sharpness, 
+                  'sigma_in': sigma_in, 
+                  'sigma_out': sigma_out,
+                  'num_interpolations': int(num_interpolations),
+                  'beta': beta}
+    
     json.dump(param_dict, open(save_dir / 'parameters.json', 'w+'), indent=4)
     
     # Iterate over samples and perform full calibration for each sample (per every image)
@@ -130,6 +138,7 @@ def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, 
         # Log images for contours
         log_contour = [[] for _ in range(n)]
         log_diff_contour = [[] for _ in range(n)]
+        log_diff_flux = [[] for _ in range(n)]
         log_pred_center_indices = [[] for _ in range(n)]
         
         # Get the required data from the batch
@@ -151,7 +160,7 @@ def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, 
         
         # Get the bitmap indices of the true flux centers (for plotting)
         target_areas = [model.scenario.get_target_area(target_area_name) for target_area_name in target_area_names]
-        true_flux_bitmaps = normalize_and_interpolate(true_flux_bitmaps, num_interpolations).squeeze(0)
+        # true_flux_bitmaps = normalize_and_interpolate(true_flux_bitmaps, num_interpolations).squeeze(0)
         true_flux_center_indices =  [get_bitmap_indices_from_center_coordinates(
             true_flux_bitmaps[i], true_flux_centers[i], target_area.center, target_area.plane_e, target_area.plane_u, device
             ) for i, target_area in enumerate(target_areas)]
@@ -165,59 +174,66 @@ def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, 
         model.tb_logger.set_helio_and_calib_ids(helio_and_calib_ids)
         
         
-        def apply_gaussian_find_contours(input_bitmaps, sigma_out=2.5, sharpness=20, threshold=0.1):
+        def apply_gaussian_find_contours(input_bitmaps, sigma_in=2.5, sigma_out=2.5, sharpness=20, threshold=0.1, num_interpolations=0):
             """
             Function for applying gaussian blurring to input bitmap and returning the upper contour.
             """
-            # Apply gauss on input
+            # First normalize inputs
+            input_bitmaps = normalize_images(input_bitmaps)
+            
+            gauss_bitmaps = torch.empty_like(input_bitmaps)
             gauss_contours = torch.empty_like(input_bitmaps)
             for i in range(input_bitmaps.shape[0]):
-                # gauss_bitmap = gaussian_filter_2d(input_bitmaps[i], sigma=sigma_in)
-                contour = find_soft_contour_pytorch_vertical(input_bitmaps[i], threshold=threshold, sharpness=sharpness)
+                # Apply Gaussian filter on inputs, save and return
+                gauss_bitmaps[i] = gaussian_filter_2d(input_bitmaps[i], sigma=sigma_in)
+                # Find contours, apply Gaussian filter on output
+                contour = find_soft_contour_pytorch_vertical(gauss_bitmaps[i], threshold=threshold, sharpness=sharpness)
                 gauss_contours[i] = gaussian_filter_2d(contour.squeeze(0), sigma=sigma_out)
-            gauss_contours = normalize_images(gauss_contours)
-            return gauss_contours
+            # Normalize output
+            gauss_contours = normalize_and_interpolate(gauss_contours, num_interpolations).squeeze(0)
+            return gauss_contours, gauss_bitmaps
         
         # Find True Contours and save as pngs.
-        true_contours = apply_gaussian_find_contours(true_flux_bitmaps, sigma_out, final_sharpness, threshold)
+        true_contours, true_bitmaps = apply_gaussian_find_contours(true_flux_bitmaps, sigma_in, sigma_out, sharpness, threshold, num_interpolations)
         # true_contours = normalize_and_interpolate(true_contours.unsqueeze(0), num_interpolations).squeeze(0)
         for i in range(true_contours.shape[0]):
             calibration_id = calibration_ids[i]
             save_bitmap(true_contours[i], directory / name / str(n_sample) / f'{calibration_id}_True_Contour.png')
             save_bitmap_with_center_cross(true_contours[i], true_flux_center_indices[i], directory / name / str(n_sample) / f'{calibration_id}_True_Contour_center.png')
-        
-        sharpness = 10
+            save_bitmap_with_center_cross(true_bitmaps[i], true_flux_center_indices[i], directory / name / str(n_sample) / f'{calibration_id}_True_Flux_center.png')
+            
         # Optimize per sample for n_epochs
         for epoch in range(n_epochs):
             # Set model to train
             model.train()
             # Perform forward pass
-            all_orientations, all_pred_flux_bitmaps = model.forward(data_batch)
+            all_orientations, all_pred_bitmaps = model.forward(data_batch)
             
             # Evaluate model 
-            alignment_loss, alignment_errors, true_alignment_errors = model.evaluate_model(epoch, all_orientations, all_pred_flux_bitmaps, data_batch)
+            alignment_loss, alignment_errors, true_alignment_errors = model.evaluate_model(epoch, all_orientations, all_pred_bitmaps, data_batch)
 
             # Find Contour of predicted bitmap
             # pred_flux_bitmaps = normalize_images(all_pred_flux_bitmaps[0, :, :, :])  # Only first sample is used
-            if epoch > 200:
-                sharpness = 10 + (epoch - 200) / 400 * (final_sharpness - 10) 
+            # if epoch > 200:
+            #     sharpness = 10 + (epoch - 200) / 400 * (final_sharpness - 10) 
 
-            sharpness = min(sharpness, final_sharpness)
-
-            pred_flux_bitmaps = normalize_and_interpolate(all_pred_flux_bitmaps, num_interpolations).squeeze(0)
-            pred_contours = apply_gaussian_find_contours(pred_flux_bitmaps, sigma_out, sharpness, threshold)
+            pred_bitmaps = all_pred_bitmaps.squeeze(0)
+            # pred_flux_bitmaps = normalize_and_interpolate(all_pred_flux_bitmaps, num_interpolations).squeeze(0)
+            pred_contours, pred_bitmaps = apply_gaussian_find_contours(pred_bitmaps, sigma_in, sigma_out, sharpness, threshold, num_interpolations)
             # pred_contours = normalize_and_interpolate(pred_contours.unsqueeze(0), num_interpolations).squeeze(0)
             diff_contours = pred_contours - true_contours
+            diff_bitmaps = pred_bitmaps - true_bitmaps
             
-            if epoch % 40 == 0 or epoch == n_epochs - 1:
+            if epoch % 20 == 0 or epoch == n_epochs - 1:
                 # Log centroid coordinates of predictions as well as contours
                 for i, area in enumerate(target_areas): 
-                    pred_flux_bitmap = pred_flux_bitmaps[i]
-                    pred_flux_center = get_center_of_mass(pred_flux_bitmap, area.center, area.plane_e, area.plane_u, device=device)
-                    indices = get_bitmap_indices_from_center_coordinates(pred_flux_bitmap, torch.tensor(pred_flux_center, device=device), area.center, area.plane_e, area.plane_u, device)
+                    pred_bitmap = pred_bitmaps[i]
+                    pred_flux_center = get_center_of_mass(pred_bitmap, area.center, area.plane_e, area.plane_u, device=device)
+                    indices = get_bitmap_indices_from_center_coordinates(pred_bitmap, torch.tensor(pred_flux_center, device=device), area.center, area.plane_e, area.plane_u, device)
                     log_pred_center_indices[i].append(indices)
                     log_contour[i].append(pred_contours[i].cpu().detach().numpy())
                     log_diff_contour[i].append(diff_contours[i].cpu().detach().numpy())
+                    log_diff_flux[i].append(diff_bitmaps[i].cpu().detach().numpy())
 
             # Save contour prediction for last epoch 
             if epoch == n_epochs - 1:
@@ -225,20 +241,32 @@ def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, 
                     calibration_id = calibration_ids[i]
                     save_bitmap(pred_contours[i], directory / name / str(n_sample) / f'{calibration_id}_Pred_Contour.png')
                     save_bitmap_with_center_cross(pred_contours[i], log_pred_center_indices[i][-1], directory/name/str(n_sample)/f'{calibration_id}_Pred_Contour_center.png')
-                
-            # Calculate Contour MSE Loss
+                    save_bitmap_with_center_cross(pred_bitmaps[i], log_pred_center_indices[i][-1], directory/name/str(n_sample)/f'{calibration_id}_Pred_Flux_center.png')
+                    
+            # Calculate MSE Loss on Flux and Contours
             mse_fnc = torch.nn.MSELoss()
+            flux_mse = mse_fnc(pred_bitmaps, true_bitmaps)
             contour_mse = mse_fnc(pred_contours, true_contours)
+            
+            # Calculate the Distance Map Loss, computationally quite expensive!
+            # contour_dist = dist_loss_image_batch(pred_contours, true_contours) / 10e8
 
+            alignment_loss *= 10e6
             # Combine losses
-            alignment_loss *= 1e6
-            if epoch < 200:
+            first, second, third, fourth = n_epochs / 8, n_epochs / 4, n_epochs  / 2, n_epochs * (3/4)
+            if epoch < first:  # First epochs only use vectorial alignment loss
                 loss = alignment_loss
-            elif epoch < 600: 
-                alpha = (epoch - 200) / 400
-                loss = contour_mse * alpha + alignment_loss * (1 - alpha)
-            else: 
-                loss = contour_mse + alignment_loss / 10
+            elif epoch < second:  # Make gradual transition to image-based loss
+                alpha1 = (epoch - first) / (second - first)  # 0 at 'first', 1 at 'second'
+                flux_n_contour = beta * flux_mse + (1 - beta) * contour_mse 
+                loss = alpha1 * (flux_n_contour) + (1 - alpha1 + 1 / 50) * alignment_loss
+            elif epoch < third: 
+                alpha2 = (1 - (epoch - second) / (third - second)) # 1 at 'second', 0 at 'third'
+                loss = alpha2 * beta * flux_mse + (1 - alpha2 * beta) * contour_mse + alignment_loss / 50
+            elif epoch < fourth:
+                loss = contour_mse + alignment_loss / 50
+            else:
+                loss = contour_mse
                 
             # Backward
             model.optimizer.zero_grad()
@@ -248,9 +276,10 @@ def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, 
             current_lr = model.optimizer.param_groups[0]['lr']
             
             print(f"[Sample: {n_sample+1} / {n_samples}] [Epoch: {epoch} / {n_epochs}]" \
-                  f"[Alignment Loss: {alignment_loss.item(): .6f}] [Contour Loss: {contour_mse.item(): .6f}] [Loss: {loss.item(): .6f}]" \
+                  f"[Alignment Loss: {alignment_loss.item(): .6f}] [Contour Loss: {contour_mse.item(): .6f}]" \
+                  f"[Flux Loss: {flux_mse.item(): .6f}] [Loss: {loss.item(): .6f}]" \
                   f"[Error: {alignment_errors.mean().item(): .4f}] [True Error: {true_alignment_errors.mean().item(): .4f}]" \
-                  f"[LR: {current_lr: .10f}]")
+                  f"[LR: {current_lr: .6f}]")
             
             # Log the metrics and losses
             for i in range(len(calibration_ids)):
@@ -258,20 +287,23 @@ def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, 
                 log_true_alignment_errors[i].append(true_alignment_errors[0, i].item())
                 
             log_mse_loss.append(alignment_loss.item())
-            log_combined_loss.append(loss.item())
             log_contour_loss.append(contour_mse.item())
+            log_img_loss.append(flux_mse.item())
+            log_combined_loss.append(loss.item())
             
         logs['alignment_errors'].append(log_alignment_errors)
         logs['true_alignment_errors'].append(log_true_alignment_errors)
-        # logs['mse_image_loss'].append(log_img_loss)
+        logs['mse_image_loss'].append(log_img_loss)
         logs['mse_alignment_loss'].append(log_mse_loss)
         logs['mse_contour_loss'].append(log_contour_loss)
         logs['combined_loss'].append(log_combined_loss)
         
         for i, log_diff_c in enumerate(log_diff_contour):
             cal_id = calibration_ids[i]
-            save_bitmaps_as_gif(log_diff_c, true_flux_center_indices[i], log_pred_center_indices[i], directory/name/str(n_sample)/f'{cal_id}_Diff_Contour.gif', )
-        
+            save_bitmaps_as_gif(log_diff_c, true_flux_center_indices[i], log_pred_center_indices[i], directory/name/str(n_sample)/f'{cal_id}_Diff_Contour.gif')
+            log_diff_f = log_diff_flux[i]
+            save_bitmaps_as_gif(log_diff_f, true_flux_center_indices[i], log_pred_center_indices[i],  directory/name/str(n_sample)/f'{cal_id}_Diff_Flux.gif')
+            
         # Count number of final alignment errors that are over threshold [mrad]
         last_errors = [helio_errors[-1] for sample in logs['true_alignment_errors'] for helio_errors in sample]
         num_above_threshold = sum(1 for err in last_errors if err > 0.5)
