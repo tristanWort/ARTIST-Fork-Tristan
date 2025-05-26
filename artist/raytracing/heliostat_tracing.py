@@ -207,10 +207,8 @@ class HeliostatRayTracer:
 
     Attributes
     ----------
-    heliostat : Heliostat
-        The heliostat considered for raytracing.
-    target_area : TargetArea
-        The target area considered for raytracing.
+    scenario : Scenario
+        The scenario containing the heliostat field considered for raytracing.
     world_size : int
         The world size i.e., the overall number of processors / ranks.
     rank : int
@@ -230,12 +228,16 @@ class HeliostatRayTracer:
     -------
     trace_rays()
         Perform heliostat raytracing.
+    trace_rays_separate()
+        Perform heliostat raytracing to separate target areas.
     scatter_rays()
         Scatter the reflected rays around the preferred ray direction.
     sample_bitmap()
         Sample a bitmap (flux density distribution) of the reflected rays on the target area.
     normalize_bitmap()
         Normalize a bitmap.
+    normalize_bitmaps()
+        Normalize a batch of bitmaps.
     """
 
     def __init__(
@@ -263,8 +265,6 @@ class HeliostatRayTracer:
             The scenario used to perform raytracing.
         aim_point_area : str
             The target area on in which the aimpoint is supposed to be.
-        heliostat_index : int
-            Index of heliostat from the heliostat list (default: 0).
         world_size : int
             The world size (default: 1).
         rank : int
@@ -473,6 +473,8 @@ class HeliostatRayTracer:
 
             # Separate indices by target area and store in dictionary
             sep_heliostat_indices = {target_area: [] for target_area in self.scenario.target_areas.target_area_list}
+
+            # Distribute heliostat indices over the target areas
             for i in heliostat_indices:
                 sep_heliostat_indices[target_areas[i]].append(i)
 
@@ -734,6 +736,43 @@ class HeliostatRayTracer:
         return bitmap / (
             self.distortions_dataset.distortions_u.numel() * plane_area_per_pixel
         )
+        
+    def normalize_bitmaps(
+        self,
+        bitmaps: torch.Tensor,
+        target_areas: list[TargetArea],
+    ) -> torch.Tensor:
+        """
+        Normalize a batch of bitmaps.
+
+        Parameters
+        ----------
+        bitmaps : torch.Tensor
+            Tensor of shape [B, H_img, W_img] representing the batch of bitmaps.
+
+        target_area : TargetArea
+            The associated target area object containing `plane_e` and `plane_u`.
+
+        Returns
+        -------
+        torch.Tensor
+            Normalized bitmaps of shape [B, H_img, W_img].
+        """
+        assert bitmaps.dim() == 3
+        
+        norm_bitmaps = torch.empty_like(bitmaps, device=bitmaps.device)
+        for i, target_area in enumerate(target_areas):
+            bitmap = bitmaps[i]
+            bitmap_height, bitmap_width = bitmap.shape
+
+            plane_area = target_area.plane_e * target_area.plane_u
+            num_pixels = bitmap_height * bitmap_width
+            plane_area_per_pixel = plane_area / num_pixels
+
+            normalization_factor = self.distortions_dataset.distortions_u.numel() * plane_area_per_pixel
+            norm_bitmaps[i] = bitmap / normalization_factor
+            
+        return norm_bitmaps
 
     def trace_rays_multi_sun(
             self,
