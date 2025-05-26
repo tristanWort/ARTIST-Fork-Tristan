@@ -180,7 +180,7 @@ optimizer_use_motor_positions = "use_motor_positions"
 
 paint_target_area_geometry = "type"
 """Key to access the target area geometry in a ``PAINT`` tower.json file."""
-paint_calibration_traget = "target_name"
+paint_calibration_target = "target_name"
 """Key to access the calibration target name in a ``PAINT`` tower.json file."""
 paint_power_plant_properties = "power_plant_properties"
 """Key to access the power plant properties in a ``PAINT`` tower.json file."""
