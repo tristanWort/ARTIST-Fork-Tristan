@@ -8,6 +8,7 @@ import sys
 import os
 import re
 import json
+import scipy
 
 from datetime import datetime
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -25,17 +26,25 @@ from artist.util.scenario import Scenario
 from artist.raytracing import raytracing_utils
 from artist.raytracing.heliostat_tracing import HeliostatRayTracer
 from artist.util import utils
+from artist.util.utils import get_center_of_mass
 
-import my_config_dict
-from calibration_datasplitter import CalibrationDataSplitter
-from calibration_dataloader import CalibrationDataLoader
-from logger import TensorboardLogger
-from util import (get_rigid_body_kinematic_parameters_from_scenario, 
-                  count_parameters, 
-                  check_for_nan_grad, 
-                  create_parameter_groups, 
-                  find_soft_contour_vertical,
-                  normalize_and_interpolate)
+# Add local artist path for raytracing with multiple parallel heliostats.
+repo_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal'))
+sys.path.insert(0, repo_path)
+import HeliOptiCal.utils.my_config_dict as my_config_dict
+from HeliOptiCal.data_processing.calibration_datasplitter import CalibrationDataSplitter
+from HeliOptiCal.data_processing.calibration_dataloader import CalibrationDataLoader
+from HeliOptiCal.data_processing.logger import TensorboardLogger
+from HeliOptiCal.utils.util import (
+    get_rigid_body_kinematic_parameters_from_scenario, 
+    count_parameters, 
+    check_for_nan_grad, 
+    create_parameter_groups, 
+    find_soft_contour_vertical,
+    normalize_and_interpolate, 
+    normalize_images
+    )
+from HeliOptiCal.plot_results.plot_errors_distributions import analyze_heliostat_field
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
@@ -70,14 +79,16 @@ class CalibrationModel(nn.Module):
         # Perform general model configurations
         self.run_config = run_config  # save for later usage
         general_config = run_config[my_config_dict.run_config_general]
-        
+
         self.name = f"run_{datetime.now().strftime('%y%m%d%H%M')}_{general_config[my_config_dict.general_name]}" 
+        # self.name = name
         log.info(f"Initializing a Heliostat Calibration Model: {self.name}")
         self.save_directory = Path(general_config[my_config_dict.general_save_to_directory]) / self.name
+        # self.save_directory = Path(self.name)
         self.tb_logger = None  # later set logger for present run
         
         self.device = general_config[my_config_dict.general_device]
-        
+    
         # Load the scenario
         self.scenario, self.target_areas = self.load_scenario(general_config[my_config_dict.general_scenario_path])
         self.heliostat_ids = self.scenario.heliostat_field.all_heliostat_names
@@ -119,7 +130,7 @@ class CalibrationModel(nn.Module):
 
         # Add errors to kinematic model
         if bool(self.run_config[my_config_dict.run_config_general][my_config_dict.general_introduce_random_errors]):
-            from add_random_errors import add_random_errors_to_kinematic
+            from HeliOptiCal.utils.util_errors import add_random_errors_to_kinematic
             error_config = self.run_config[my_config_dict.run_config_initial_errors]
             seed = self.run_config[my_config_dict.run_config_general][my_config_dict.general_random_seed]            
             error_kinematic = add_random_errors_to_kinematic(error_config, loaded_scenario, self.save_directory/'errors',
@@ -136,15 +147,14 @@ class CalibrationModel(nn.Module):
         """
         # Get the loss type configurations 
         loss_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config]
-        model_flux_center_predictions = loss_config[my_config_dict.general_mode_flux_center].lower()
+        loss_basis = loss_config[my_config_dict.general_loss_basis].lower()
         
         # Perform sanity check for the given configurations for raytracer use and loss type
-        if self.use_raytracing and ('ideal' in model_flux_center_predictions):
-            log.warning(f"Raytracer use is configured although your chosen loss only considers Heliostat orientations."\
-                "Using the Raytracer leads to increased runtimes. Make sure that this is what you want.")
-        elif not self.use_raytracing and not ('ideal' in model_flux_center_predictions):
-            raise TypeError(f"Your chosen loss type is image based and therefore requires Raytracer use to be activated."\
-                "Please change your configurations.")
+        if self.use_raytracing and ('orientation' in loss_basis):
+            log.warning(f"use_raytracing is set to 'True' although your loss only considers Heliostat orientations."\
+                "Using the Raytracer results in a high demand on computing and increased runtime. Make sure that this is what you want.")
+        elif not self.use_raytracing and not ('orientation' in loss_basis):
+            raise TypeError(f"loss_basis is configured to {loss_basis} which requires flux outputs from Raytracing. Set use_raytracing to True.")
             
         # Before raytracer setup, Heliostat field needs to be aligned
         heliostat_field = scenario.heliostat_field
@@ -275,6 +285,8 @@ class CalibrationModel(nn.Module):
                     optimizer,
                     factor=cfg[my_config_dict.model_reduce_on_plateau_factor],
                     patience=cfg[my_config_dict.model_reduce_on_plateau_patience],
+                    threshold=cfg[my_config_dict.model_reduce_on_plateau_treshold],
+                    min_lr=cfg[my_config_dict.model_reduce_on_plateau_min_lr],
                     verbose=False
                 )
 
@@ -340,12 +352,12 @@ class CalibrationModel(nn.Module):
             split_types=dataset_config[my_config_dict.dataset_split_types],
             save_splits_plots=True
         )
-        # Configure dataloader
+        # Configure dataloader for training
         calibration_data_loader = CalibrationDataLoader(
             data_directory=dataset_config[my_config_dict.dataset_training_data_directory],
             heliostats_to_load=self.heliostat_ids,
             power_plant_position=self.scenario.power_plant_position,
-            load_flux_images=True, #bool(self.use_raytracing),
+            load_flux_images=bool(self.use_raytracing),
             preload_flux_images=bool(dataset_config[my_config_dict.dataset_preload_flux_images]),
             is_simulated_data=bool(dataset_config[my_config_dict.dataset_training_data_was_simulated]),
             properties_file_ends_with=dataset_config[my_config_dict.dataset_properties_suffix],
@@ -377,19 +389,18 @@ class CalibrationModel(nn.Module):
                                                                 device=device)
             # Save Tensor for the orientations of Heliostats
             field_orientations[sample] = heliostat_field.rigid_body_kinematic.orientations
+            if torch.isnan(field_orientations[sample]).any():
+                print(f"Orientations are NaN in sampe {sample}")
             
             # Perform Raytracing if configured
             if self.use_raytracing:
                 incident_ray_directions = data[my_config_dict.field_sample_incident_rays]
                 target_area_names = data[my_config_dict.field_sample_target_names]
                 target_areas = [self.target_areas[name] for name in target_area_names]
-                pred_flux_bitmaps[sample] = raytracer.trace_rays_separate(incident_ray_directions=incident_ray_directions,
+                sample_flux_bitmaps = raytracer.trace_rays_separate(incident_ray_directions=incident_ray_directions,
                                                                     target_areas=target_areas,
                                                                     device=device)
-                
-                # Normalization caused CUDA out of memory error
-                # pred_flux_bitmaps[sample] = self.raytracer.normalize_bitmaps(bitmaps=sample_flux_bitmaps, target_areas=target_areas)
-                
+                pred_flux_bitmaps[sample] = sample_flux_bitmaps
         return field_orientations, pred_flux_bitmaps
     
     @staticmethod
@@ -475,7 +486,6 @@ class CalibrationModel(nn.Module):
         """
         Calculate and return the ENU-coordinates of the center of mass for a batch of bitmaps.
         """
-        from artist.util.utils import get_center_of_mass
         device = bitmaps.device
         
         # Initiate output Tensor
@@ -514,7 +524,7 @@ class CalibrationModel(nn.Module):
                 "pred_flux_centers and orientations must have equal batch sizes and number of Heliostat."
     
     @staticmethod
-    def extract_upper_contours(bitmaps: torch.Tensor, threshold=0.5, sharpness=30.0, num_interpolate=0):
+    def extract_upper_contours(bitmaps: torch.Tensor, threshold=0.5, sharpness=20.0, num_interpolate=0):
         """
         
         """
@@ -531,48 +541,82 @@ class CalibrationModel(nn.Module):
         # Get nested list of target area names and stacked Tensor of incident ray directions from batch data
         target_areas = [sample[my_config_dict.field_sample_target_names] for sample in field_batch]
         incident_ray_directions = torch.stack([sample[my_config_dict.field_sample_incident_rays] for sample in field_batch])
-        # true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] for sample in field_batch])
-        
-        true_flux_bitmaps = torch.stack([sample[my_config_dict.field_sample_flux_images] for sample in field_batch])
-        with torch.no_grad():
-            true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas)
         
         # All inputs must have the same batch size
         assert len(target_areas) == orientations.shape[0] == pred_flux_bitmaps.shape[0],\
             "Batch sizes must be equal for target_areas, orientations and pred_flux_bitmaps."
         
-        # Get the loss type configurations 
-        loss_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config]
-        mode = loss_config[my_config_dict.general_mode_flux_center].lower()
-        
-        # Mask for empty bitmaps
-        if self.use_raytracing:
-            sums = pred_flux_bitmaps.sum(dim=[-1, -2])
-            empty_mask = (sums < 0.001)  # [B, H]
-            empty_count = empty_mask.sum().item()
-            self.tb_logger.log_metric(epoch, "EmptyPredFluxCount", empty_count)
-            if empty_count > 0:
-                log_steps = self.run_config[my_config_dict.run_config_general][my_config_dict.general_logging_steps]
-                if epoch % log_steps == 0:
-                    log.info(f"{self.tb_logger.mode} Batch: Count of empty flux predictions: {empty_count} of {empty_mask.numel()}")
-
-        if "ideal" in mode:
-            # Calculate the reflcetion directions directly form the Heliostat orientations
-            pred_reflection_directions = self.calc_reflection_directions_from_orientations(
-                incident_ray_directions=incident_ray_directions,
-                orientations=orientations)
-        
-        else:  # use flux bitmaps
-        
-            # Fallback reflection directions (for empty bitmaps)
-            fallback_reflections = self.calc_reflection_directions_from_orientations(incident_ray_directions=incident_ray_directions,
-                                                                                     orientations=orientations)
-                
-            if "measured" in mode:
-                # Calculate the center of mass coordinates of focal spots
-                pred_flux_centers = self.calc_centers_of_mass(bitmaps=pred_flux_bitmaps, target_area_names=target_areas)
+        # 1) Calculate model metric: Alignment Errors from True vs Pred Reflection Directions
+        with torch.no_grad():  # re-calculate flux-centers as ``PAINT`` coordinates for flux centers were inconsistent
+            if self.use_raytracing:
+                true_flux_bitmaps = torch.stack([sample[my_config_dict.field_sample_flux_images] for sample in field_batch])
+                true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas)
+            else:
+                true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] for sample in field_batch])
             
-            elif "contour" in mode:               
+        true_reflection_directions = self.calc_reflection_directions_from_flux_centers(true_flux_centers, orientations)
+        pred_reflection_directions = self.calc_reflection_directions_from_orientations(incident_ray_directions, orientations)
+        with torch.no_grad():
+            eval_alignment_errors = self.calc_alignment_errors_stable(pred_reflection_directions, true_reflection_directions)
+            self.tb_logger.log_alignment_errors(epoch=epoch, alignment_errors=eval_alignment_errors)
+        
+        # 2) Calculate Alignment Loss based on configurations (Can be based on vectorial alignments or based on flux images)
+        loss_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config]
+        alignment_loss_basis = loss_config[my_config_dict.general_loss_basis].lower()
+        
+        if "orientation" in alignment_loss_basis:
+            cosine_similarities = self.calc_cosine_similarities(pred_reflection_directions, true_reflection_directions)
+ 
+        elif "center_of_mass" in alignment_loss_basis:
+            empty_mask, empty_count = self.count_empty_flux_predictions(pred_flux_bitmaps, epoch=epoch, threshold=1) 
+            fallback_reflections = self.calc_reflection_directions_from_orientations(incident_ray_directions=incident_ray_directions,
+                                                                                     orientations=orientations)  # needed for instances of empty flux bitmaps
+            mass_centers = self.calc_centers_of_mass(bitmaps=pred_flux_bitmaps, target_area_names=target_areas)
+            reflection_from_centers = self.calc_reflection_directions_from_flux_centers(mass_centers, orientations)
+            pred_reflection_directions = torch.where(empty_mask.unsqueeze(-1),  fallback_reflections, reflection_from_centers)
+            cosine_similarities = self.calc_cosine_similarities(pred_reflection_directions, true_reflection_directions)
+                   
+        else:
+            raise ValueError(f"Unsupported value for alignment_loss_basis: {alignment_loss_basis}")   
+        
+        alignment_loss = self.calc_loss_from_cosine_similarities(cosine_similarities) * 1e6
+        self.tb_logger.log_loss(f"AlignmentLoss_{loss_config[my_config_dict.general_loss_type]}", alignment_loss.mean().item(), epoch)
+        
+        # 3) Calculate the "actual" alignment errors if ideal flux center is known, ie. data was simulated
+        actual_alignment_errors = {}
+        if self.dataloader.is_simulated_data:  # data should contain the ideal flux centers
+            with torch.no_grad():
+                # Calculate the "actual" alignment errors based on the known reflection axis
+                true_flux_centers = torch.stack([sample[my_config_dict.field_sample_ideal_flux_centers] for sample in field_batch])
+                true_reflection_directions = self.calc_reflection_directions_from_flux_centers(true_flux_centers, orientations)
+                actual_alignment_errors = self.calc_alignment_errors_stable(pred_reflection_directions, true_reflection_directions)
+        
+            self.tb_logger.log_alignment_errors(epoch=epoch, alignment_errors=actual_alignment_errors, is_actual=True)
+        
+        # 4) Calculate Image-based Loss if this is configured 
+        if self.use_raytracing:
+            # Normalize
+            # true_flux_bitmaps = normalize_images(true_flux_bitmaps)
+            # pred_flux_bitmaps = normalize_images(pred_flux_bitmaps)
+            
+            # Log flux images
+            if epoch == 0:
+                self.tb_logger.log_flux_bitmaps(epoch, true_flux_bitmaps, type='TrueFlux')
+            if epoch % 100 == 0 or epoch == 0:                   
+                self.tb_logger.log_flux_bitmaps(epoch, pred_flux_bitmaps, type='PredFlux')
+                self.tb_logger.log_diff_flux_bitmaps(epoch, pred_flux_bitmaps, true_flux_bitmaps, type='DiffFlux')
+            
+        return alignment_loss.mean(), eval_alignment_errors, actual_alignment_errors
+    
+        """
+    def calc_flux_image_loss(self, pred_flux_bitmpas: torch.Tensor, true_flux_bitmaps: torch.Tensor):
+        """
+        
+        """
+        loss_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config]
+        image_loss_key = loss_config[my_config_dict.general_flux_img_loss]
+        
+        if "contour" in image_loss_key:               
                 # Extracts upper contour bitmaps of both the true and predicted flux images
                 true_contour_bitmaps = self.extract_upper_contours(bitmaps=true_flux_bitmaps, threshold=0.5, num_interpolate=4)
                 pred_contour_bitmaps = self.extract_upper_contours(bitmaps=pred_flux_bitmaps, threshold=0.5, num_interpolate=4)
@@ -585,46 +629,13 @@ class CalibrationModel(nn.Module):
                 true_flux_centers = self.calc_centers_of_mass(bitmaps=true_contour_bitmaps, target_area_names=target_areas)
                 pred_flux_centers = self.calc_centers_of_mass(bitmaps=pred_contour_bitmaps, target_area_names=target_areas)
                 
-            else:
-                raise ValueError(f"Unsupported mode for flux center predictions: {model_flux_center_predictions}")
+        else:
+            raise ValueError(f"Unsupported mode for flux center predictions: {model_flux_center_predictions}")        
 
-            # Use flux centers where available, otherwise use fallback
-            reflection_from_centers = self.calc_reflection_directions_from_flux_centers(pred_flux_centers, orientations)
-            pred_reflection_directions = torch.where(empty_mask.unsqueeze(-1),  # [B, H, 1]
-                                                    fallback_reflections,
-                                                    reflection_from_centers)
-            
-        # Prepare loss on alignment errors
-        true_reflection_directions = self.calc_reflection_directions_from_flux_centers(flux_centers=true_flux_centers, orientations=orientations)
-        cosine_similarites = self.calc_cosine_similarities(pred_vector=pred_reflection_directions, true_vector=true_reflection_directions)
-        # Calculate loss on cosine similarities
-        loss = self.calc_loss_from_cosine_similarities(cosine_similarities=cosine_similarites, epoch=epoch)
-                
-        # Calculate the evaluation metric (alignment error)
-        with torch.no_grad():
-            if self.dataloader.is_simulated_data:  # data should contain the ideal flux centers
-                true_flux_centers = torch.stack([sample[my_config_dict.field_sample_ideal_flux_centers] for sample in field_batch])
-                
-            else:  # use measured centers
-                # true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] for sample in field_batch])
-                true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas)
-            
-            true_reflection_directions = self.calc_reflection_directions_from_flux_centers(flux_centers=true_flux_centers,
-                                                                                            orientations=orientations)     
-            # Calculate alignment errors for model evaluation
-            alignment_errors = self.calc_alignment_errors_stable(pred_vector=pred_reflection_directions, true_vector=true_reflection_directions)
+        return 
+        """
         
-        self.tb_logger.log_alignment_errors(epoch=epoch, alignment_errors=alignment_errors)
-        
-        if self.use_raytracing:
-            self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=true_flux_bitmaps, type='TrueFlux')
-            self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=pred_flux_bitmaps, type='PredFlux')
-            diff_flux_bitmaps = pred_flux_bitmaps - true_flux_bitmaps
-            self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=diff_flux_bitmaps, type='DiffFlux')
-            
-        return loss, alignment_errors         
-
-    def calibrate(self, device: Optional[Union[torch.device, str]] = None):
+    def calibrate(self, blocking=0, device: Optional[Union[torch.device, str]] = None):
         """
         
         """ 
@@ -660,6 +671,9 @@ class CalibrationModel(nn.Module):
                 best_val_error = float('inf')
                 worst_error_across_field = float('inf')
                 
+                # Log initial parameter state
+                self.tb_logger.log_parameters_obj(-1, self.learnable_params_dict)
+                
                 # Set early stopping if worst error drops below tolerance
                 while epoch < sum_epochs and worst_error_across_field > tolerance:
                     # Apply phased learning if configured
@@ -673,17 +687,16 @@ class CalibrationModel(nn.Module):
                     self.tb_logger.set_helio_and_calib_ids(split_ids_train)
                     data_batch_train = self.dataloader.get_field_batch(helio_and_calib_ids=split_ids_train, device=device)
                     field_orientations, pred_flux_bitmaps = self.forward(data_batch_train)
-                    train_loss, train_alignment_errors = self.evaluate_model(epoch, field_orientations, pred_flux_bitmaps, data_batch_train)    
-                    self.log_alignment_errors(epoch=epoch, alignment_errors=train_alignment_errors, helio_and_calib_ids=split_ids_train)              
-
-                    # Log parameters
-                    self.tb_logger.log_parameters_obj(epoch, self.learnable_params_dict)
+                    train_loss, train_alignment_errors, _ = self.evaluate_model(epoch, field_orientations, pred_flux_bitmaps, data_batch_train)             
                 
                     # Backward
                     self.optimizer.zero_grad()
                     train_loss.backward()
                     check_for_nan_grad(self.learnable_params_dict)
                     self.optimizer.step()
+                    
+                    # Log parameters
+                    self.tb_logger.log_parameters_obj(epoch, self.learnable_params_dict)
                         
                     # Validation
                     self.eval()
@@ -693,8 +706,7 @@ class CalibrationModel(nn.Module):
                     with torch.no_grad():
                         data_batch_val = self.dataloader.get_field_batch(helio_and_calib_ids=split_ids_val, device=device)
                         val_orientations, val_pred_bitmaps = self.forward(data_batch_val)
-                        val_loss, val_alignment_errors = self.evaluate_model(epoch, val_orientations, val_pred_bitmaps, data_batch_val)
-                    self.log_alignment_errors(epoch=epoch, alignment_errors=val_alignment_errors, helio_and_calib_ids=split_ids_val) 
+                        val_loss, val_alignment_errors, _ = self.evaluate_model(epoch, val_orientations, val_pred_bitmaps, data_batch_val)
                     
                     # Step schedulers if not None
                     if self.schedulers:
@@ -709,32 +721,64 @@ class CalibrationModel(nn.Module):
                     self.tb_logger.log_metric(epoch, 'BaseLearningRate', current_lr)
                     
                     epoch += 1
-                    
-                    
                     if epoch % log_steps == 0:
                         
                         log.info(f"Epoch: {epoch} of {sum_epochs}, "
                          f"Train / Val Loss: {train_loss.item():.6f} / {val_loss.item():.6f}, "
                          f"Train / Val Avg.Error (mrad): {train_alignment_errors.mean().item():.2f} / {val_alignment_errors.mean().item():.2f}, "
-                         f"LR: {current_lr}")
+                         f"LR: {current_lr: 8f}")
                     
                     if val_alignment_errors.max().item() < worst_error_across_field:
                         worst_error_across_field = val_alignment_errors.max().item()
-                    
-                    
-                # Save last parameters
-                self.tb_logger.log_parameters_obj(epoch, self.learnable_params_dict)
+
+                    # Save backup csv for every 100 epochs
+                    if epoch % 100 == 0:
+                        self.tb_logger.save_dataframes_to_csv()
                 
                 # Testing
+                epoch -= 1  # keep epoch index consistent for logging purposes
                 self.eval()
                 split_ids_test = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'test', heliostat_ids=self.heliostat_ids)
                 self.tb_logger.set_mode("Test")
                 self.tb_logger.set_helio_and_calib_ids(split_ids_test)
                 data_batch_test = self.dataloader.get_field_batch(helio_and_calib_ids=split_ids_test, device=device)
                 test_orientations, test_pred_bitmaps = self.forward(data_batch_test)
-                _, test_alignment_errors = self.evaluate_model(epoch, test_orientations, test_pred_bitmaps, data_batch_test)
-                self.log_alignment_errors(epoch=epoch, alignment_errors=test_alignment_errors, helio_and_calib_ids=split_ids_test)
-                log.info(f"Finally: Test Avg.Error (mrad): {test_alignment_errors.mean().item():.2f}") 
+                _, test_alignment_errors, actual_alignment_errors = self.evaluate_model(epoch, test_orientations, test_pred_bitmaps, data_batch_test)
+                log.info(f"Finally: Test Avg.Error (mrad): {test_alignment_errors.mean().item():.2f}, Actual Avg.Error (mrad): {actual_alignment_errors.mean().item():.2f}")
+                
+                from plot_results.plot_test_errors import plot_alignment_error_comparison, plot_alignment_error_comparison_with_averages
+                plot_alignment_error_comparison(test_alignment_errors, 
+                                                actual_alignment_errors,  
+                                                heliostat_names=self.heliostat_ids,
+                                                save_dir=self.save_directory / 'plots',
+                                                blocking=blocking)
+                
+                plot_alignment_error_comparison_with_averages(test_alignment_errors, 
+                                                actual_alignment_errors,  
+                                                heliostat_names=self.heliostat_ids,
+                                                save_dir=self.save_directory / 'plots',
+                                                blocking=blocking)
+                
+                plot_alignment_error_comparison(test_alignment_errors, 
+                                                actual_alignment_errors,  
+                                                heliostat_names=self.heliostat_ids,
+                                                save_dir=self.save_directory / 'log_plots',
+                                                log_scale=True,blocking=blocking)
+                
+                plot_alignment_error_comparison_with_averages(test_alignment_errors, 
+                                                actual_alignment_errors,  
+                                                heliostat_names=self.heliostat_ids,
+                                                save_dir=self.save_directory / 'log_plots',
+                                                log_scale=True,
+                                                blocking=blocking)
+
+                # plot_comparative_sun_pos_error_distributions(test_errors=test_alignment_errors,
+                #                                              true_test_errors=actual_alignment_errors,
+                #                                              data_batch_test=data_batch_test,
+                #                                              heliostat_ids=self.heliostat_ids,
+                #                                              output_dir=self.save_directory / 'plots',
+                #                                             display_type='show_size')
+                self.tb_logger.close()
             
     def phase_freeze_training(self, current_epoch: int, phase_counter: int):
         """
@@ -773,7 +817,7 @@ class CalibrationModel(nn.Module):
             # Move to next epoch sequence in lr scheduler
             epoch_accumulator += epochs
             
-    def freeze_params(self, freeze_params: List[str] = [], logging: bool=True):
+    def freeze_params(self, freeze_params: List[str] = [],  logging: bool=True):
         # Iterate over the nested parameters and freeze / unfreeze
         # Names and parameter lists in the learnable parameters dict
         for name, param_group in self.learnable_params_dict.items():
@@ -822,6 +866,10 @@ class CalibrationModel(nn.Module):
             pred_vector = pred_vector.unsqueeze(0)
             true_vector = true_vector.unsqueeze(0) 
         
+        # Delete 4th coordinate dimension
+        pred_vector = pred_vector[:, :, 0:3]
+        true_vector = true_vector[:, :, 0:3]
+        
         # Calculate normalized vectors
         m1 = torch.norm(pred_vector, dim=-1, dtype=torch.float64)
         m2 = torch.norm(true_vector, dim=-1, dtype=torch.float64)
@@ -832,7 +880,7 @@ class CalibrationModel(nn.Module):
         return cos_sim
     
                 
-    def calc_loss_from_cosine_similarities(self, cosine_similarities: torch.Tensor, epoch: int):
+    def calc_loss_from_cosine_similarities(self, cosine_similarities: torch.Tensor):
         """
         Calculate loss from cosine similarities for each heliostat independently.
 
@@ -842,6 +890,11 @@ class CalibrationModel(nn.Module):
         Returns:
             torch.Tensor: Tensor with mean loss value for Heliostat field
         """
+        """
+        # Add scaling factor for loss
+        sf_loss = 1e6
+        
+        """       
         # Add scaling factor for loss
         sf_loss = 1e6
         
@@ -890,19 +943,20 @@ class CalibrationModel(nn.Module):
         else:
             raise ValueError(f"Unsupported loss type: {loss_type}")
 
-        loss = per_heliostat_loss.mean()
-        self.tb_logger.log_loss(f"Loss_{loss_type}", loss.item(), epoch)
-        
-        return per_heliostat_loss.mean() * sf_loss
+        return per_heliostat_loss
         
     @staticmethod
-    def calc_alignment_errors_stable(pred_vector: torch.Tensor, true_vector: torch.Tensor, epsilon: float = 1e-10): 
+    def calc_alignment_errors_stable(pred_vector: torch.Tensor, true_vector: torch.Tensor, epsilon: float = 1e-12): 
         assert pred_vector.shape == true_vector.shape, 'Given pred_vector and true_vector must have identical shapes.'
         
         # Bring to shape [B, H, 4], if other shape is given
         while pred_vector.dim() < 3:  
             pred_vector = pred_vector.unsqueeze(0)
             true_vector = true_vector.unsqueeze(0) 
+        
+        # Delete 4th coordinate dimension
+        pred_vector = pred_vector[:, :, 0:3]
+        true_vector = true_vector[:, :, 0:3]
         
         # Calculate normalized vectors
         m1 = torch.norm(pred_vector, dim=-1, dtype=torch.float64)
@@ -917,6 +971,49 @@ class CalibrationModel(nn.Module):
         angles_mrad = angles_rad * 1000
         
         return angles_mrad
+    
+    def count_empty_flux_predictions(self, pred_flux_bitmaps: torch.Tensor, epoch: int, threshold=1):
+        """
+        Counts number of empty flux prediction samples in the input Bitmaps. Input needs to be normalized.
+        Returns mask for empty bitmaps and total count of empty instances.
+        """
+        assert pred_flux_bitmaps.dim() > 2, \
+            "Expected pred_flux_bitmaps to have at least 3 dimensions, not {pred_flux_bitmaps.dim()} dimensions."
+        sums = pred_flux_bitmaps.sum(dim=[-1, -2])
+        min_sum = sums.min()
+        empty_mask = (sums < threshold)  # [B, H]
+        empty_count = empty_mask.sum().item()
+        self.tb_logger.log_metric(epoch, "CountOfEmptyFluxPredictions", empty_count)
+        
+        if empty_count > 0:
+            log_steps = self.run_config[my_config_dict.run_config_general][my_config_dict.general_logging_steps]
+            if epoch % log_steps == 0:
+                log.info(f"{self.tb_logger.mode} Batch: Count of empty flux bitmap predictions: {empty_count} of {empty_mask.numel()}")
+        return empty_mask, empty_count
+    
+    def dist_loss_image_batch(self, true_flux_bitmap: torch.Tensor, pred_flux_bitmap: torch.Tensor, epoch: int):
+        """
+        Calculate the distance 
+        """
+        assert true_flux_bitmap.shape == pred_flux_bitmap.shape, \
+            "Mismatch in shapes of true_flux_bitmap {true_flux_bitmap.shape} and pred_flux_bitmaps {pred_flux_bitmap.shape}."
+        
+        assert true_flux_bitmap.dim() == 2, "Expected input bitmaps to have 2 dimensions instead of {true_flux_bitmap.dim()}"       
+        
+        # Generate reference image       
+        with torch.no_grad():
+            reference_binary = (true_flux_bitmap > 0.01 * torch.max(true_flux_bitmap)).cpu().numpy()
+            distance_map_np = scipy.ndimage.distance_transform_edt(1 - reference_binary)
+            distance_map = torch.tensor(distance_map_np, device=true_flux_bitmap.device, dtype=torch.float32)
+
+        loss_dist = (pred_flux_bitmap * distance_map).sum()
+        
+        # self.tb_logger.log_loss('DistanceMap', loss_dist.item(), epoch)
+        # self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=true_flux_bitmap.unsqueeze(0).unsqueeze(0), type='TrueFlux')
+        # self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=pred_flux_bitmap.unsqueeze(0).unsqueeze(0), type='PredFlux')
+        # diff_image = normalize_images((pred_flux_bitmap - true_flux_bitmap).unsqueeze(0)).unsqueeze(0)
+        self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=diff_image, type='DiffFlux')
+        return loss_dist
     
     def log_parameters(self, epoch: int, obj=None, name=None, heliostat_idx=None, index=None):
         # Delete, instead use TensorboardLogger module
