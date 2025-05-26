@@ -323,15 +323,6 @@ class HeliostatField(torch.nn.Module):
         device : Union[torch.device, str]
             The device on which to initialize tensors (default is cuda).
         """
-        # rigid_body_kinematic = RigidBody(
-        #     number_of_heliostats=self.number_of_heliostats,
-        #     heliostat_positions=self.all_heliostat_positions,
-        #     aim_points=self.all_aim_points,
-        #     actuator_parameters=self.all_actuator_parameters,
-        #     initial_orientations=self.all_initial_orientations,
-        #     deviation_parameters=self.all_kinematic_deviation_parameters,
-        #     device=device
-        # )
         device = torch.device(device)
         (
             self.all_current_aligned_surface_points,
