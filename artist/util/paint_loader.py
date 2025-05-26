@@ -26,12 +26,12 @@ from artist.util.surface_converter import SurfaceConverter
 
 
 def extract_paint_calibration_data(
-git    calibration_properties_paths: list[pathlib.Path],
+    calibration_properties_paths: list[pathlib.Path],
     power_plant_position: torch.Tensor,
     device: Union[torch.device, str] = "cuda",
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Extract calibration data from ``PAINT`` calibration files.
+    Extract calibration dagit ta from ``PAINT`` calibration files.
 
     Parameters
     ----------
