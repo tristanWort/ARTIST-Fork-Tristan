@@ -4,10 +4,72 @@ import torchvision.transforms as transforms
 from torchmetrics.functional.segmentation import hausdorff_distance
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 import torch.nn as nn
+import scipy
+import scipy.ndimage
 from PIL import Image
 from pathlib import Path
 import time
 import matplotlib.pyplot as plt
+
+
+def distance_transform_tensor(mask: torch.Tensor):
+    """
+    Compute Euclidean distance transform of a binary mask for each sample in the batch.
+    Assumes mask is (B, 1, H, W).
+    """
+    masks_np = mask.cpu().numpy()
+    dist_maps = []
+    for m in masks_np:
+        m_bin = (m > 0.1).astype(np.uint8).squeeze(0)
+        dist_map = scipy.ndimage.distance_transform_edt(1 - m_bin)  # distance to nearest foreground
+        dist_maps.append(dist_map)
+    return torch.tensor(dist_maps, dtype=torch.float32, device=mask.device).unsqueeze(1)
+
+
+def sdf_loss(pred_contour: torch.Tensor, target_contour: torch.Tensor):
+    """
+    Penalizes predicted contour pixels based on distance from ground truth.
+    """
+    if pred_contour.dim() == 3:
+        pred_contour = pred_contour.unsqueeze(1)
+    if target_contour.dim() == 3:
+        target_contour = target_contour.unsqueeze(1)
+        
+    # Distance transform on the target (constant for backprop)
+    dist_map = distance_transform_tensor(target_contour.detach())  # shape (B, 1, H, W)
+    
+    # Element-wise product (penalize predicted pixels farther from target)
+    loss = (pred_contour * dist_map).mean()
+    return loss
+
+
+def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
+    """
+    Computes the Dice loss between two tensors.
+
+    Parameters
+    ----------
+    pred : torch.Tensor
+        Predicted mask (after sigmoid), shape (B, 1, H, W)
+    target : torch.Tensor
+        Ground truth mask, same shape as pred
+    eps : float
+        Small constant for numerical stability
+
+    Returns
+    -------
+    torch.Tensor
+        Dice loss averaged over the batch
+    """
+    pred_flat = pred.view(pred.size(0), -1)
+    target_flat = target.view(target.size(0), -1)
+
+    intersection = (pred_flat * target_flat).sum(dim=1)
+    denominator = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
+
+    dice_score = (2. * intersection + eps) / (denominator + eps)
+    return 1 - dice_score.mean()
+
 
 def contour_difference(predictions, targets, threshold=0.5, sharpness=20.0):
     """
@@ -111,6 +173,26 @@ def find_soft_contour_pytorch_vertical(tensor_img, threshold=0.5, sharpness=20.0
     # Clamp values to [0, 1]
     soft_contour = soft_contour.clamp(0, 1)
     return soft_contour * mask  # Values in [0,1], Shape: (1, H, W)
+
+
+def dist_loss_image_batch(pred_images: torch.Tensor, true_images: torch.Tensor, threshold: int = 0.1):
+    """
+    Calculate the mean distance between two batches of images. Uses true_images as reference.
+    """
+    assert true_images.shape == pred_images.shape, \
+        f"Mismatch in shapes of true_images {true_images.shape} and pred_images {pred_images.shape}."
+    assert true_images.dim() == 3, f"Expected input bitmaps to have 3 dimensions instead of {true_images.dim()}"       
+    
+    # Generate reference images and calculate distance for each image pair
+    B, device = true_images.shape[0], true_images.device
+    loss_distances = torch.empty(B, device=device)
+    for b in range(B):
+        with torch.no_grad():
+            reference_binary = (true_images[b] > threshold * torch.max(true_images[b])).cpu().numpy()
+            distance_map_np = scipy.ndimage.distance_transform_edt(1 - reference_binary)
+            distance_map = torch.tensor(distance_map_np, device=device, dtype=torch.float32)
+        loss_distances[b] = (pred_images[b] * distance_map).sum()
+    return loss_distances.mean()
 
 
 def mse_by_pixel(
