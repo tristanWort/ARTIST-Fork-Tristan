@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import numpy as np
 import pandas as pd
@@ -13,6 +14,11 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 import glob
 import logging
 import seaborn as sns
+
+# Add local artist path for raytracing with multiple parallel heliostats.
+repo_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal'))
+sys.path.insert(0, repo_path)
+from HeliOptiCal.utils.util import normalize_images_with_threshold
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
@@ -355,7 +361,7 @@ class TensorboardLogger:
         else:
             self.writer.add_image(f"{image_name}/{self.mode}/{heliostat_id}", image.cpu().detach(), epoch, dataformats='HW')
     
-    def log_flux_bitmaps(self, epoch: int, bitmaps: torch.Tensor, type: str, helio_and_calib_ids=None):
+    def log_flux_bitmaps(self, epoch: int, bitmaps: torch.Tensor, type: str, helio_and_calib_ids=None, normalize=True):
         """
         Log a batch of flux bitmaps per heliostat and calibration ID.
 
@@ -376,11 +382,58 @@ class TensorboardLogger:
 
         bitmaps = bitmaps.detach().cpu()
         B, H, H_img, W_img = bitmaps.shape
+        
+        norm_bitmaps = torch.zeros_like(bitmaps)
+        if normalize:
+            for b in range(B):
+                norm_bitmaps[b] = normalize_images_with_threshold(bitmaps[b], threshold=1)
+        else:
+            norm_bitmaps = bitmaps
 
         for h_idx, (heliostat_id, calib_ids) in enumerate(helio_and_calib_ids.items()):
             for b in range(len(calib_ids)):
                 calib_id = calib_ids[b]
-                image = bitmaps[b, h_idx]  # shape [H_img, W_img]
+                image = norm_bitmaps[b, h_idx]  # shape [H_img, W_img]
+                self.log_image(epoch, image, type, heliostat_id, calib_id=calib_id)
+                
+    def log_diff_flux_bitmaps(self, epoch: int, pred_bitmaps: torch.Tensor, true_bitmaps: torch.Tensor, type: str, helio_and_calib_ids=None, normalize=True):
+        """
+        Log a batch of flux bitmaps per heliostat and calibration ID.
+
+        Parameters
+        ----------
+        bitmaps : torch.Tensor
+            Tensor of shape [B, H, H_img, W_img], containing image bitmaps.
+        epoch : int
+            Current epoch.
+        helio_and_calib_ids : Dict[str, List[int]]
+            Dictionary mapping heliostat IDs to calibration ID lists (default is None, then use self.helio_and_calib_ids).
+        """
+        assert pred_bitmaps.shape == true_bitmaps.shape, "pred_bitmaps and true_bitmaps must have equal shapes."
+        
+        if helio_and_calib_ids is None:
+            helio_and_calib_ids = self.helio_and_calib_ids
+            
+        if self.mode is None:
+            raise RuntimeError("Logger mode must be set before logging.")
+
+        pred_bitmaps = pred_bitmaps.detach().cpu()
+        true_bitmaps = true_bitmaps.detach().cpu()
+        B, H, H_img, W_img = pred_bitmaps.shape
+        
+        norm_diff_bitmaps = torch.zeros_like(pred_bitmaps)
+        if normalize:
+            for b in range(B):
+                norm_pred_bitmaps = normalize_images_with_threshold(pred_bitmaps[b], threshold=1)
+                norm_true_bitmaps = normalize_images_with_threshold(true_bitmaps[b], threshold=1)
+                norm_diff_bitmaps[b] = norm_pred_bitmaps - norm_true_bitmaps
+        else:
+            norm_diff_bitmaps = pred_bitmaps - true_bitmaps
+
+        for h_idx, (heliostat_id, calib_ids) in enumerate(helio_and_calib_ids.items()):
+            for b in range(len(calib_ids)):
+                calib_id = calib_ids[b]
+                image = norm_diff_bitmaps[b, h_idx]  # shape [H_img, W_img]
                 self.log_image(epoch, image, type, heliostat_id, calib_id=calib_id)
                 
     def save_dataframes_to_csv(self, output_dir: Optional[Union[str, Path]] = None):
