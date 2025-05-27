@@ -17,11 +17,12 @@ from matplotlib import pyplot as plt, animation
 # Add local artist path for raytracing with multiple parallel heliostats.
 repo_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal'))
 sys.path.insert(0, repo_path)
-from HeliOptiCal.calibration_model import CalibrationModel
+from HeliOptiCal.image_losses.calibration_model import CalibrationModel
 from HeliOptiCal.utils import my_config_dict
 from HeliOptiCal.data_processing.logger import TensorboardLogger
 from HeliOptiCal.utils.util import normalize_images, normalize_and_interpolate, get_bitmap_indices_from_center_coordinates
-from HeliOptiCal.image_losses.image_loss import find_soft_contour_pytorch_vertical, dist_loss_image_batch, chamfer_distance_batch_optimized
+from HeliOptiCal.image_losses.image_loss import (find_soft_contour_pytorch_vertical, dice_loss, chamfer_distance_batch_optimized)
+from HeliOptiCal.image_losses.image_loss import dist_loss_image_batch
 from HeliOptiCal.utils.util_simulate import gaussian_filter_2d
 from HeliOptiCal.utils.util import calculate_intersection
 from HeliOptiCal.image_losses.calibrate_per_image import save_bitmap, save_bitmap_with_center_cross, save_bitmaps_as_gif
@@ -77,42 +78,48 @@ def save_training_plots_multiple_heliostats(logs: dict, helio_idx: int, log_dir:
     plot_metric(true_alignment_errors, "True Alignment Error Evolution", "Error [mrad]", f"all_true_errors.png")
     
 
-def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_sharpness, sigma_in, sigma_out, num_interpolations, beta, tolerance=10):
-    
+def run_experiment(run_config, n_epochs, n_samples, threshold, final_sharpness, sigma_in, sigma_out, num_interpolations, beta, 
+                   tolerance=10, h_idx=None,  # if set to None, perform experiment for all heliostats in scenario
+                   ):
+    # === BASIC SETUP
     # Set directory for storing outputs and saving logs.
-    directory = Path("/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/image_losses/runs/AA39")
+    directory = Path("/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/image_losses/runs/6Heliostats")
     name = Path(f"run_{datetime.now().strftime('%y%m%d%H%M')}_6Heliostats")  # for unique identification
     
     # Initiate a calibration model
-    init_model = CalibrationModel(run_config=run_config, name=directory / name)
+    init_model = CalibrationModel(run_config=run_config, name=directory/name)
     device = init_model.device
     save_dir = init_model.save_directory
     
+    # Get Data splits
     splits = init_model.datasplitter.splits
     split_df = splits['knn'][(30, 30)]
-    
     all_heliostat_ids = init_model.heliostat_ids
     helio_and_calib_ids = {heliostat_id: split_df.loc[split_df[mappings.HELIOSTAT_ID] == heliostat_id].index.tolist()
                        for heliostat_id in all_heliostat_ids}
     keep_logger = TensorboardLogger(run='log', heliostat_names=all_heliostat_ids, log_dir=directory / name)
 
+    # Redefine h_idx if None was given 
+    if h_idx is None:
+        h_idxs = [i for i in range(len(all_heliostat_ids))]
+    else:
+        h_idxs = [h_idx]
+    
     # Get the calibration data as a batch   
     batch = init_model.dataloader.get_field_batch(helio_and_calib_ids=helio_and_calib_ids, device=device)
     
     # Log important metrics and losses
     logs = {}
-    
     logs['calibration_ids'] = []
     logs['alignment_errors'] = []
     logs['true_alignment_errors'] = []
     logs['mse_alignment_loss'] = []
     logs['mse_contour_loss'] = []
     logs['chamfer_distance_loss'] = []
+    logs['dist_loss'] = []
     logs['combined_loss'] = []
     
     # save parameters
-    # param_dict = {'threshold': threshold, 'sharpness': sharpness, 'sigma_in:': sigma_in, 'sigma_out': sigma_out, 'num_interpolations': int(num_interpolations)}
-    # param_dict = {'threshold': threshold, 'final_sharpness': final_sharpness, 'num_interpolations': int(num_interpolations), 'sigma_out': sigma_out}
     param_dict = {'threshold': threshold, 
                   'final_sharpness': int(final_sharpness), 
                   'sigma_in': sigma_in, 
@@ -120,13 +127,13 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
                   'num_interpolations': int(num_interpolations),
                   'beta': beta,
                   }
-    
     json.dump(param_dict, open(save_dir / 'parameters.json', 'w+'), indent=4)
     
     # Iterate over samples and perform full calibration for each sample (per every image)
     for n_sample, data in enumerate(batch[:n_samples]):
         torch.cuda.empty_cache()
         
+        # === PER-SAMPLE SETUP
         # Log statistics for each sample's calibration results
         log = dict()
         n = len(all_heliostat_ids)
@@ -134,6 +141,7 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
         log_true_alignment_errors = [[] for _ in range(n)]
         log_mse_loss = []
         log_chd_loss = []
+        log_dist_loss = []
         log_combined_loss = []
         log_contour_loss = []
 
@@ -174,7 +182,7 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
         # Set logger
         model.tb_logger.set_mode("Train")
         model.tb_logger.set_helio_and_calib_ids(helio_and_calib_ids)
-        
+
         
         def apply_gaussian_find_contours(input_bitmaps, sharpness=20, threshold=0.1, sigma_in=2.5, sigma_out=2.5, num_interpolations=0):
             """
@@ -199,7 +207,7 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
         # Find True Contours and save as pngs.
         true_contours, _ = apply_gaussian_find_contours(true_bitmaps, final_sharpness, threshold, sigma_in, sigma_out, num_interpolations)
         # true_contours = normalize_and_interpolate(true_contours.unsqueeze(0), num_interpolations).squeeze(0)
-        for i in [h_idx]:
+        for i in h_idxs:
             calibration_id = calibration_ids[i]
             save_bitmap(true_contours[i], directory / name / str(n_sample) / f'{calibration_id}_True_Contour.png')
             save_bitmap_with_center_cross(true_contours[i], true_flux_center_indices[i], directory / name / str(n_sample) / f'{calibration_id}_True_Contour_center.png')
@@ -233,6 +241,7 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
 
             diff_contours = pred_contours - true_contours
             diff_bitmaps = pred_bitmaps - true_bitmaps
+            distances = []
             
             if epoch % 20 == 0 or epoch == n_epochs - 1:
                 # Log centroid coordinates of predictions as well as contours
@@ -243,6 +252,7 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
                     surface_normal = all_orientations[0, i, 0:4, 2]
                     reflected_ray = raytracing_utils.reflect(incident_ray_directions[i], surface_normal)
                     ideal_center, t = calculate_intersection(all_orientations[0, i, 0:4, 3], reflected_ray, area.center, area.normal_vector)
+                    distances.appennd(t.item())
                     indices = get_bitmap_indices_from_center_coordinates(pred_bitmap, ideal_center, area.center, area.plane_e, area.plane_u, device)
                     log_pred_center_indices[i].append(indices)
                     log_contour[i].append(pred_contours[i].cpu().detach().numpy())
@@ -251,7 +261,7 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
 
             # Save contour prediction for last epoch 
             if epoch == n_epochs - 1:
-                for i in [h_idx]:
+                for i in h_idxs:
                     calibration_id = calibration_ids[i]
                     save_bitmap(pred_contours[i], directory / name / str(n_sample) / f'{calibration_id}_Pred_Contour.png')
                     save_bitmap_with_center_cross(pred_contours[i], log_pred_center_indices[i][-1], directory/name/str(n_sample)/f'{calibration_id}_Pred_Contour_center.png')
@@ -259,27 +269,34 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
                     
             # Calculate MSE Loss on Flux and Contours
             mse_fnc = torch.nn.MSELoss()
-            flux_mse = mse_fnc(pred_bitmaps[h_idx], true_bitmaps[h_idx])
-            contour_mse = mse_fnc(pred_contours[h_idx], true_contours[h_idx])
+            all_flux_mse  = torch.empty(len(h_idxs), device=device)
+            all_contour_mse = torch.empty_like(all_flux_mse)
+            all_contour_chd = torch.empty_like(all_flux_mse)
+            all_contour_dist = torch.empty_like(all_flux_mse)
+            all_alignment_loss = torch.empty_like(all_flux_mse)
             
-            # Calculate the Distance Map Loss, computationally quite expensive!
-            # contour_dist = dist_loss_image_batch(pred_contours, true_contours) / 10e8
-            chd_loss = chamfer_distance_batch_optimized(pred_contours[h_idx].unsqueeze(0), true_contours[h_idx].unsqueeze(0)).mean()
-            chd_loss /= 10e3
+            for i in h_idxs:
+                all_flux_mse[i] = mse_fnc(pred_bitmaps[i], true_bitmaps[i])
+                all_contour_mse[i] = mse_fnc(pred_contours[i], true_contours[i])
+                all_contour_chd[i] = chamfer_distance_batch_optimized(pred_contours[i].unsqueeze(0), true_contours[i].unsqueeze(0))
+                all_contour_dist[i] = dist_loss_image_batch(pred_contours[i].unsqueeze(0), true_contours[i].unsqueeze(0))
+                all_alignment_loss[i] = alignment_loss[i]
+                
+            sf_chd = 10e-5
+            sf_dist = 10e-7
             
-            alignment_loss = 10e6 * alignment_loss[h_idx]
+            alignment_loss = all_alignment_loss.mean()
+            flux_mse = all_flux_mse.mean()
+            contour_mse = all_contour_mse.mean()
+            chd_loss = all_contour_chd.mean() * sf_chd
+            dist_loss = all_contour_dist.mean() * sf_dist
+            
             # Combine losses
             if epoch < first:  # First epochs only use vectorial alignment loss
                 loss = alignment_loss
             elif epoch < second:  # Make gradual transition to image-based loss
                 alpha1 = (epoch - first) / (second - first)  # 0 at 'first', 1 at 'second'
-                # flux_n_contour = beta * flux_mse + (1 - beta) * contour_mse 
                 loss = alpha1 * ((1-beta) * contour_mse + beta * chd_loss) + (1 - alpha1) * alignment_loss
-            # elif epoch < third: 
-            #     alpha2 = (1 - (epoch - second) / (third - second)) # 1 at 'second', 0 at 'third'
-            #     loss = alpha2 * beta * flux_mse + (1 - alpha2 * beta) * contour_mse + alignment_loss / 50
-            # elif epoch < fourth:
-            #     loss = contour_mse + alignment_loss / 50
             elif epoch < third:
                 alpha2 = (epoch - second) / (third - second)
                 loss = (1-beta) * contour_mse + chd_loss * beta * (1 - alpha2)
@@ -293,10 +310,15 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
             model.schedulers.step(loss)
             current_lr = model.optimizer.param_groups[0]['lr']
             
+            relevant_alignment_erors = [alignment_errors[:, i].item() for i in h_idxs]
+            mean_alignment_error = sum(error for error in relevant_alignment_erors) / len(relevant_alignment_erors)
+            relevant_true_alignment_erors = [true_alignment_errors[:, i].item() for i in h_idxs]
+            mean_true_alignment_error = sum(error for error in relevant_true_alignment_erors) / len(relevant_true_alignment_erors)
+            
             print(f"[Sample: {n_sample+1} / {n_samples}] [Epoch: {epoch} / {n_epochs}]" \
                   f"[Alignment Loss: {alignment_loss.item(): .6f}] [Contour Loss: {contour_mse.item(): .6f}]" \
                   f"[CHD Loss: {chd_loss.item(): .6f}] [Loss: {loss.item(): .6f}]" \
-                  f"[Error: {alignment_errors[:, h_idx].mean().item(): .4f}] [True Error: {true_alignment_errors[:, h_idx].mean().item(): .4f}]" \
+                  f"[Error: {mean_alignment_error: .4f}] [True Error: {mean_true_alignment_error: .4f}]" \
                   f"[LR: {current_lr: .6f}]")
             
             # Log the metrics and losses
@@ -307,16 +329,18 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
             log_mse_loss.append(alignment_loss.item())
             log_contour_loss.append(contour_mse.item())
             log_chd_loss.append(chd_loss.item())
+            log_dist_loss.append(dist_loss.item())
             log_combined_loss.append(loss.item())
             
         logs['alignment_errors'].append(log_alignment_errors)
         logs['true_alignment_errors'].append(log_true_alignment_errors)
         logs['chamfer_distance_loss'].append(log_chd_loss)
+        logs['dist_loss'].append(log_dist_loss)
         logs['mse_alignment_loss'].append(log_mse_loss)
         logs['mse_contour_loss'].append(log_contour_loss)
         logs['combined_loss'].append(log_combined_loss)
         
-        for i in [h_idx]:
+        for i in h_idxs:
             cal_id = calibration_ids[i]
             log_diff_c = log_diff_contour[i]
             save_bitmaps_as_gif(log_diff_c, true_flux_center_indices[i], log_pred_center_indices[i], directory/name/str(n_sample)/f'{cal_id}_Diff_Contour.gif')
@@ -329,7 +353,8 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
         # Compute MSE of all final alignment errors
         # mse_last_errors = sum(err**2 for err in last_errors) / len(last_errors)
         
-        last_errors = [sample[h_idx][-1] for sample in logs['true_alignment_errors']]
+        last_errors = [sample[i][-1] for sample in logs['true_alignment_errors'] for i in h_idxs]
+        # last_errors = [sample[h_idx][-1] for sample in logs['true_alignment_errors'] for ]
         mse_last_errors = sum(err**2 for err in last_errors) / len(last_errors)
         # Stop exploration
         if mse_last_errors > tolerance:
@@ -337,7 +362,7 @@ def run_experiment(run_config, n_epochs, n_samples, h_idx, threshold, final_shar
         
     keep_logger.close()
     print('Done with all samples. Generating Plots...')      
-    for i in [h_idx]:
+    for i in h_idxs:
         heliostat = all_heliostat_ids[i]
         save_training_plots_multiple_heliostats(logs=logs, helio_idx=i, log_dir=directory / name / f'plots/{heliostat}')
 
