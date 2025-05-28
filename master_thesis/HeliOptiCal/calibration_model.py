@@ -421,7 +421,7 @@ class CalibrationModel(nn.Module):
                 
                     # Backward
                     self.optimizer.zero_grad()
-                    # torch.autograd.set_detect_anomaly(True)  #
+                    torch.autograd.set_detect_anomaly(True)  #
                     train_loss.backward()
                     check_for_nan_grad(self.learnable_params_dict)
                     self.optimizer.step()
@@ -710,10 +710,11 @@ class CalibrationModel(nn.Module):
             f"pred_bitmaps and true_bitmaps must have equal shapes, but have {pred_bitmaps.shape} and {true_bitmaps.shape}"
         
         B, H = pred_bitmaps.shape[0], pred_bitmaps.shape[1]
-        fine_loss_per_heliostat = torch.zeros(H, device=pred_bitmaps.device)
-        coarse_loss_per_heliostat = torch.zeros(H, device=pred_bitmaps.device)
-        pred_contours = torch.zeros_like(pred_bitmaps)
-        true_contours = torch.zeros_like(pred_bitmaps)
+        device = pred_bitmaps.device
+        fine_loss_per_heliostat = torch.zeros(H, device=device)
+        coarse_loss_per_heliostat = torch.zeros(H, device=device)
+        pred_contours = torch.zeros_like(pred_bitmaps, device=device)
+        true_contours = torch.zeros_like(pred_bitmaps, device=device)
         
         # Get the contour loss configurations
         contour_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config][my_config_dict.general_contour_config]
@@ -747,10 +748,10 @@ class CalibrationModel(nn.Module):
         mse_fnc = torch.nn.MSELoss()
         # Iterate over Heliostat indices
         for h_idx in range(H):
-            pred_contours[:, h_idx] = self.find_upper_contour(pred_bitmaps[:, h_idx], threshold, sharpness, num_interpolate, sigma_in, sigma_out)
-            true_contours[:, h_idx] = self.find_upper_contour(true_bitmaps[:, h_idx], threshold, sharpness, num_interpolate, sigma_in, sigma_out)
-            fine_loss_per_heliostat[h_idx] = mse_fnc(pred_contours[:, h_idx], true_contours[:, h_idx]).mean() * loss_scaling["MSE"]
-            coarse_loss_per_heliostat[h_idx] = sdf_loss(pred_contours[:, h_idx], true_contours[:, h_idx]).mean() * loss_scaling["SDF"]
+            pred_contours = self.find_upper_contour(pred_bitmaps[:, h_idx], threshold, sharpness, num_interpolate, sigma_in, sigma_out)
+            true_contours = self.find_upper_contour(true_bitmaps[:, h_idx], threshold, sharpness, num_interpolate, sigma_in, sigma_out)
+            fine_loss_per_heliostat[h_idx] = mse_fnc(pred_contours, true_contours).mean() * loss_scaling["MSE"]
+            coarse_loss_per_heliostat[h_idx] = sdf_loss(pred_contours, true_contours).mean() * loss_scaling["SDF"]
             
         # Log contour images
         # if epoch == warumup:
@@ -923,25 +924,25 @@ class CalibrationModel(nn.Module):
     @staticmethod
     def find_upper_contour(bitmaps: torch.Tensor, threshold=0.4, sharpness=60.0, num_interpolate=4, sigma_in=10.0, sigma_out=15.0):
         """
-        bitmaps [B, H, W]
+        Safely extract upper contours from flux bitmaps. Avoids in-place ops that break autograd.
         """
-        # 1. Normalize and interpolate input flux bitmaps for smoothed resolution
-        norm_bitmaps = normalize_and_interpolate(bitmaps, num_interpolate).squeeze(0) 
+        # 1. Normalize and interpolate for smoothing
+        norm_bitmaps = normalize_and_interpolate(bitmaps, num_interpolate).squeeze(0)  # [B, H, W]
         
-        gauss_bitmaps = torch.zeros_like(norm_bitmaps)
-        raw_contours = torch.zeros_like(norm_bitmaps)
-        output_contours = torch.zeros_like(norm_bitmaps)
-        for b in range(bitmaps.shape[0]):
-            # 2. Add Gaussian noise on input image
-            gauss_bitmaps[b] = gaussian_filter_2d(norm_bitmaps[b], sigma=sigma_in)
-            # 3. Look for contour
-            raw_contours[b] = find_soft_contour_pytorch_vertical(gauss_bitmaps[b], threshold=threshold, sharpness=sharpness)
-            # 4. Add Gaussian noise on found contour image
-            output_contours[b] = gaussian_filter_2d(raw_contours[b].squeeze(0), sigma=sigma_out)
-        # 5. Normalize and interpolate output
-        output_contours = normalize_and_interpolate(output_contours, num_interpolate).squeeze(0)
-        output_contours = normalize_images(output_contours)
-        return output_contours         
+        smoothed_contours = []
+        for b in range(norm_bitmaps.shape[0]):
+            img = norm_bitmaps[b] # [H, W]
+            # 2. Add Gaussian blur to input
+            gauss_img = gaussian_filter_2d(img, sigma=sigma_in)  # [H, W]
+            # 3. Search for upper contour based on hyper-parameters
+            contour = find_soft_contour_pytorch_vertical(gauss_img, threshold=threshold, sharpness=sharpness)  # [1, 1, H, W]
+            # 4. Add Gaussian blur to contour for smoothing
+            smoothed = gaussian_filter_2d(contour, sigma=sigma_out).squeeze(0)  # [H, W]
+            smoothed_contours.append(smoothed)
+
+        output = torch.stack(smoothed_contours, dim=0)  # [B, H, W]
+        interpolated = normalize_and_interpolate(output, num_interpolate).squeeze(0)
+        return normalize_images(interpolated)    
     
         """
     def calc_flux_image_loss(self, pred_flux_bitmpas: torch.Tensor, true_flux_bitmaps: torch.Tensor):
