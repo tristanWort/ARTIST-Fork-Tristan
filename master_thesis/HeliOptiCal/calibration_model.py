@@ -45,7 +45,7 @@ from HeliOptiCal.utils.util import (
     normalize_images,
     calculate_intersection)
 from HeliOptiCal.plot_results.plot_errors_distributions import analyze_heliostat_field
-from HeliOptiCal.image_losses.image_loss import find_soft_contour_pytorch_vertical, dist_loss_image_batch, chamfer_distance_batch_optimized
+from HeliOptiCal.image_losses.image_loss import find_soft_contour_pytorch_vertical, sdf_loss, chamfer_distance_batch_optimized, dice_loss
 from HeliOptiCal.utils.util_simulate import gaussian_filter_2d
 
 log = logging.getLogger(__name__)
@@ -370,7 +370,8 @@ class CalibrationModel(nn.Module):
     
     def calibrate(self, blocking=0, device: Optional[Union[torch.device, str]] = None):
         """
-        
+        WARNING: This method does not yet allow calibrating for multiple splits. 
+        Re-initialize a new CalibrationModel instance for each split. 
         """ 
         device = torch.device(self.device if device is None else device)
         # Sum of scheduled epochs
@@ -384,10 +385,6 @@ class CalibrationModel(nn.Module):
                 log.info(f"Begin calibration for dataset split {split_type}: size {split_size}")
                 
                 run = f"{split_type}_{split_size}"
-                # Reset Logger, Scenario, Raytracer, and Parameters
-                # self.scenario, self.target_areas = self.load_scenario(self.run_config[my_config_dict.run_config_general][my_config_dict.general_scenario_path])
-                # self.learnable_params_dict, _, _ = get_rigid_body_kinematic_parameters_from_scenario(self.scenario.heliostat_field.rigid_body_kinematic)
-                # self.raytracer = self.init_raytraycer(self.scenario)
                 self.tb_logger = TensorboardLogger(run=run, heliostat_names=self.heliostat_ids, log_dir=self.save_directory / 'logs')
                 
                 # Set gradients to False for selection of frozen parameters
@@ -424,6 +421,7 @@ class CalibrationModel(nn.Module):
                 
                     # Backward
                     self.optimizer.zero_grad()
+                    # torch.autograd.set_detect_anomaly(True)  #
                     train_loss.backward()
                     check_for_nan_grad(self.learnable_params_dict)
                     self.optimizer.step()
@@ -467,6 +465,14 @@ class CalibrationModel(nn.Module):
                     # Save backup csv for every 100 epochs
                     if epoch % 100 == 0:
                         self.tb_logger.save_dataframes_to_csv()
+                    torch.cuda.empty_cache() 
+                    del pred_flux_bitmaps
+                    del val_pred_bitmaps
+                    del train_loss
+                    del val_loss
+                    del field_orientations
+                    del val_orientations
+                    
                 
                 # Testing
                 epoch -= 1  # keep epoch index consistent for logging purposes
@@ -579,19 +585,51 @@ class CalibrationModel(nn.Module):
             self.tb_logger.log_alignment_errors(epoch=epoch, alignment_errors=actual_alignment_errors, is_actual=True)
         
         # 4) Calculate Image-based Loss if this is configured 
+        combined_loss = alignment_loss.mean()
         if self.use_raytracing:
-            # Normalize
-            # true_flux_bitmaps = normalize_images(true_flux_bitmaps)
-            # pred_flux_bitmaps = normalize_images(pred_flux_bitmaps)
-            
+            # Check if contour-based loss is configured
+            contour_config = loss_config[my_config_dict.general_contour_config]
+            if bool(contour_config[my_config_dict.general_use_contour]): 
+                if  epoch > contour_config[my_config_dict.general_contour_warmup]:
+                    # One loss term for fine alignment (requires overlap) and one for coarse alignment (no overlap of contours) 
+                    fine_contour_loss, coarse_contour_loss = self.calc_contour_loss(true_flux_bitmaps, pred_flux_bitmaps, epoch)
+                    combined_loss = self.soft_loss_transition(alignment_loss.mean(), fine_contour_loss.mean(), coarse_contour_loss.mean(), epoch)
+                self.tb_logger.log_loss(f"CombinedLoss", combined_loss.item(), epoch)
+                
             # Log flux images
-            if epoch == 0:
-                self.tb_logger.log_flux_bitmaps(epoch, true_flux_bitmaps, type='TrueFlux')
-            if epoch % 100 == 0 or epoch == 0:                   
-                self.tb_logger.log_flux_bitmaps(epoch, pred_flux_bitmaps, type='PredFlux')
-                self.tb_logger.log_diff_flux_bitmaps(epoch, pred_flux_bitmaps, true_flux_bitmaps, type='DiffFlux')
+            # if epoch == 0:
+            #     self.tb_logger.log_flux_bitmaps(epoch, true_flux_bitmaps, type='TrueFlux')
+            # if epoch % 100 == 0 or epoch == 0:                   
+            #     self.tb_logger.log_flux_bitmaps(epoch, pred_flux_bitmaps, type='PredFlux')
+            #     self.tb_logger.log_diff_flux_bitmaps(epoch, pred_flux_bitmaps, true_flux_bitmaps, type='DiffFlux')
             
-        return alignment_loss.mean(), eval_alignment_errors, actual_alignment_errors
+        return combined_loss.mean(), eval_alignment_errors, actual_alignment_errors
+    
+    def soft_loss_transition(self, alignment_loss: torch.Tensor, fine_contour_loss: torch.Tensor, coarse_contour_loss: torch.Tensor, epoch: int,
+                             beta: float=0.5, gamma: float=0.1):
+        """
+        Combine three loss input Tensor to one single loss using a soft transition from alignment loss to contour loss terms.
+        """       
+        sum_epochs = sum(self.run_config[my_config_dict.run_config_model][my_config_dict.model_epochs_sequence])
+        contour_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config][my_config_dict.general_contour_config]
+        warmup = contour_config[my_config_dict.general_contour_warmup]
+        half = (sum_epochs - warmup) / 2 + warmup
+        
+        # Make soft transition to contour loss terms in first half
+        if epoch < half:
+            alpha = (epoch - warmup) / (half - warmup) 
+            combined_loss = alpha * ((1-beta) * fine_contour_loss + beta * coarse_contour_loss) + (1 - alpha + gamma) * alignment_loss
+        else:
+            combined_loss = (1-beta) * fine_contour_loss + beta * coarse_contour_loss +  gamma * alignment_loss
+        
+        # Log Losses
+        fine_loss_key = contour_config[my_config_dict.general_contour_fine].upper()
+        if fine_loss_key != "0":
+            self.tb_logger.log_loss(f"ContourLoss{fine_loss_key}", fine_contour_loss.mean().item(), epoch)
+        coarse_loss_key = contour_config[my_config_dict.general_contour_coarse].upper()
+        if coarse_loss_key != "0":
+            self.tb_logger.log_loss(f"ContourLoss{coarse_loss_key}", coarse_contour_loss.mean().item(), epoch)        
+        return combined_loss
     
     def calc_alignment_loss(self, cosine_similarities: torch.Tensor):
         """
@@ -649,8 +687,8 @@ class CalibrationModel(nn.Module):
         
         return loss_per_heliostat
     
-    def calc_contour_loss(pred_bitmaps: torch.Tensor, true_bitmaps: torch.Tensor, 
-                          threshold=0.5, sharpness=20.0, num_interpolate=4, sigma_in=10.0, sigma_out=20.0):    
+    def calc_contour_loss(self, pred_bitmaps: torch.Tensor, true_bitmaps: torch.Tensor, epoch,
+                          threshold=0.4, sharpness=60.0, num_interpolate=4, sigma_in=10.0, sigma_out=15.0):    
         """
         Attempts to find upper contours of both predicted and true flux bitmaps. 
         Then calculate image loss on found contours per Heliostat.
@@ -672,17 +710,56 @@ class CalibrationModel(nn.Module):
             f"pred_bitmaps and true_bitmaps must have equal shapes, but have {pred_bitmaps.shape} and {true_bitmaps.shape}"
         
         B, H = pred_bitmaps.shape[0], pred_bitmaps.shape[1]
-        loss_per_heliostat = torch.empty(H, device=pred_bitmaps.device)
-        pred_contours = torch.empty_like(pred_bitmaps)
-        true_contours = torch.empty_like(pred_bitmaps)
+        fine_loss_per_heliostat = torch.zeros(H, device=pred_bitmaps.device)
+        coarse_loss_per_heliostat = torch.zeros(H, device=pred_bitmaps.device)
+        pred_contours = torch.zeros_like(pred_bitmaps)
+        true_contours = torch.zeros_like(pred_bitmaps)
         
+        # Get the contour loss configurations
+        contour_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config][my_config_dict.general_contour_config]
+        warumup = contour_config[my_config_dict.general_contour_warmup]
+        
+        # Scale to similar magnitudes      
+        loss_scaling = {"MSE": 1, "CHD": 1e-3, "SDF": 1e-1, "DICE": 1e-2}
+        
+        # Configure fine loss function
+        fine_loss_key = contour_config[my_config_dict.general_contour_fine].upper()
+        if fine_loss_key == "0":
+            fine_loss_fnct = lambda x, y: 0 
+        elif fine_loss_key == "MSE":
+            fine_loss_fnct = lambda x, y: 0 
+        elif fine_loss_key == "DICE":
+            fine_loss_fnct = lambda x, y: dice_loss(x, y) * loss_scaling[fine_loss_key]
+        else: 
+            raise ValueError(f"Unsupported type for fine contour loss: {fine_loss_key}")    
+        
+        # Configure coarse loss function
+        coarse_loss_key = contour_config[my_config_dict.general_contour_coarse].upper()
+        if coarse_loss_key == "0":
+            coarse_loss_fnct = lambda x, y: 0 
+        elif coarse_loss_key == "CHD":
+            coarse_loss_fnct = lambda x, y: chamfer_distance_batch_optimized(x, y) * loss_scaling[coarse_loss_key]
+        elif coarse_loss_key == "SDF":
+            coarse_loss_fnct = lambda x, y: sdf_loss(x, y) * loss_scaling[coarse_loss_key]
+        else: 
+            raise ValueError(f"Unsupported type for coarse contour loss: {coarse_loss_key}")    
+        
+        mse_fnc = torch.nn.MSELoss()
         # Iterate over Heliostat indices
         for h_idx in range(H):
-            pred_contours = self.find_upper_contour(pred_bitmaps[:, H])
-            true_contours = self.find_upper_contour(true_bitmaps[:, H])
+            pred_contours[:, h_idx] = self.find_upper_contour(pred_bitmaps[:, h_idx], threshold, sharpness, num_interpolate, sigma_in, sigma_out)
+            true_contours[:, h_idx] = self.find_upper_contour(true_bitmaps[:, h_idx], threshold, sharpness, num_interpolate, sigma_in, sigma_out)
+            fine_loss_per_heliostat[h_idx] = mse_fnc(pred_contours[:, h_idx], true_contours[:, h_idx]).mean() * loss_scaling["MSE"]
+            coarse_loss_per_heliostat[h_idx] = sdf_loss(pred_contours[:, h_idx], true_contours[:, h_idx]).mean() * loss_scaling["SDF"]
+            
+        # Log contour images
+        # if epoch == warumup:
+        #     self.tb_logger.log_flux_bitmaps(epoch, true_contours, type='TrueContour')
+        # if epoch % 100 == 0 or epoch == warumup:                   
+        #     self.tb_logger.log_flux_bitmaps(epoch, pred_contours, type='PredContour')
+        #     self.tb_logger.log_diff_flux_bitmaps(epoch, pred_contours, true_contours, type='DiffContour')
         
-        
-        return loss_per_heliostat
+        return fine_loss_per_heliostat, coarse_loss_per_heliostat
            
     def calc_flux_centers_from_orientations(self, orientations: torch.Tensor, incident_ray_directions: torch.Tensor, target_area_names: List[List[str]]):
         """
@@ -806,8 +883,8 @@ class CalibrationModel(nn.Module):
         true_vector = true_vector[:, :, 0:3]
         
         # Calculate normalized vectors
-        m1 = torch.norm(pred_vector, dim=-1, dtype=torch.float64)
-        m2 = torch.norm(true_vector, dim=-1, dtype=torch.float64)
+        m1 = torch.norm(pred_vector, dim=-1)
+        m2 = torch.norm(true_vector, dim=-1)
         
         # Calculate cosine-similarity
         dot_products = torch.sum(pred_vector * true_vector, dim=-1)
@@ -844,25 +921,27 @@ class CalibrationModel(nn.Module):
         return angles_mrad
 
     @staticmethod
-    def find_upper_contour(bitmaps: torch.Tensor, threshold=0.5, sharpness=20.0, num_interpolate=4, sigma_in=10.0, sigma_out=20.0):
+    def find_upper_contour(bitmaps: torch.Tensor, threshold=0.4, sharpness=60.0, num_interpolate=4, sigma_in=10.0, sigma_out=15.0):
         """
         bitmaps [B, H, W]
         """
         # 1. Normalize and interpolate input flux bitmaps for smoothed resolution
-        norm_bitmaps = normalize_and_interpolate(bitmaps, num_interpolations).squeeze(0) 
+        norm_bitmaps = normalize_and_interpolate(bitmaps, num_interpolate).squeeze(0) 
         
-        gauss_bitmaps = torch.empty_like(norm_bitmaps)
-        output_contours = torch.empty_like(norm_bitmaps)
-        for b in range(input_bitmaps.shape[0]):
+        gauss_bitmaps = torch.zeros_like(norm_bitmaps)
+        raw_contours = torch.zeros_like(norm_bitmaps)
+        output_contours = torch.zeros_like(norm_bitmaps)
+        for b in range(bitmaps.shape[0]):
             # 2. Add Gaussian noise on input image
-            gauss_in = gaussian_filter_2d(norm_bitmaps[b], sigma=sigma_in)
+            gauss_bitmaps[b] = gaussian_filter_2d(norm_bitmaps[b], sigma=sigma_in)
             # 3. Look for contour
-            contour = find_soft_contour_pytorch_vertical(gauss_in, threshold=threshold, sharpness=sharpness)
+            raw_contours[b] = find_soft_contour_pytorch_vertical(gauss_bitmaps[b], threshold=threshold, sharpness=sharpness)
             # 4. Add Gaussian noise on found contour image
-            output_contours[b] = gaussian_filter_2d(contour.squeeze(0), sigma=sigma_out)
+            output_contours[b] = gaussian_filter_2d(raw_contours[b].squeeze(0), sigma=sigma_out)
         # 5. Normalize and interpolate output
-        contours = normalize_and_interpolate(gauss_contours, num_interpolations).squeeze(0)
-        return contours         
+        output_contours = normalize_and_interpolate(output_contours, num_interpolate).squeeze(0)
+        output_contours = normalize_images(output_contours)
+        return output_contours         
     
         """
     def calc_flux_image_loss(self, pred_flux_bitmpas: torch.Tensor, true_flux_bitmaps: torch.Tensor):
@@ -931,7 +1010,7 @@ class CalibrationModel(nn.Module):
         # self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=true_flux_bitmap.unsqueeze(0).unsqueeze(0), type='TrueFlux')
         # self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=pred_flux_bitmap.unsqueeze(0).unsqueeze(0), type='PredFlux')
         # diff_image = normalize_images((pred_flux_bitmap - true_flux_bitmap).unsqueeze(0)).unsqueeze(0)
-        self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=diff_image, type='DiffFlux')
+        # self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=diff_image, type='DiffFlux')
         return loss_dist
     
     def freeze_params(self, freeze_params: List[str] = [],  logging: bool=True):
