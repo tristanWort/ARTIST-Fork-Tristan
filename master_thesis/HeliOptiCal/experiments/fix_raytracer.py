@@ -31,6 +31,8 @@ from HeliOptiCal.data_generation.generate_scenario import build_heliostat_file_l
 from HeliOptiCal.utils import my_config_dict, util_dataset
 from HeliOptiCal.utils.util_simulate import align_and_raytrace
 from HeliOptiCal.utils.util import normalize_images
+from HeliOptiCal.image_losses.image_loss import sdf_loss, dice_loss
+
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
@@ -252,7 +254,7 @@ class FixRaytracer(torch.nn.Module):
         log.info("Begin setup...")
         scenario = self.load_scenario(scenario_h5_path)
         self.scenario = self.infuse_parameters(scenario)
-        self.raytracer = self.init_raytracer(scenario)
+        self.raytracer = self.init_raytracer(self.scenario)
         
     def load_calibration_data(self, helio_to_calib_map: Dict[str, List]):
         
@@ -326,8 +328,8 @@ class FixRaytracer(torch.nn.Module):
         if data_batch is None:
             data_batch = self.data_batch
         
-        if self.raytracer is None:
-            self.setup()
+        # if self.raytracer is None:
+        #     self.setup()
         raytracer = self.raytracer
         
         heliostat_field = self.scenario.heliostat_field 
@@ -387,23 +389,23 @@ class FixRaytracer(torch.nn.Module):
         helio_to_calib_map = self.get_map(5)
         data_batch = self.load_calibration_data(helio_to_calib_map)
         
-        with torch.autograd.set_detect_anomaly(True):
-            for epoch in range(n_epochs):
+        # with torch.autograd.set_detect_anomaly(True):
+        for epoch in range(n_epochs):
+            
+            pred_bitmaps = self.forward(data_batch)
+            if epoch % 10 == 0:
+                save_bitmap(pred_bitmaps[0, 0], save_bitmaps_dir, f"pred_0_8_{epoch}.png")
                 
-                pred_bitmaps = self.forward(data_batch)
-                if epoch % 10 == 0:
-                    save_bitmap(pred_bitmaps[0, 0], save_bitmaps_dir, f"pred_0_8_{epoch}.png")
-                    
-                loss = self.evaluate(pred_bitmaps)
-                optimizer.zero_grad()
-                torch.autograd.set_detect_anomaly(True)
+            loss = self.evaluate(pred_bitmaps)
+            optimizer.zero_grad()
+            # torch.autograd.set_detect_anomaly(True)
 
-                loss.backward()
-                optimizer.step()
-                mean = self.optimize_parameters['light_source_mean'].detach().cpu().tolist()
-                cov = self.optimize_parameters['light_source_covariance'].detach().cpu().tolist()
-                log.info(f"[Epoch {epoch} / {n_epochs}] [Loss: {loss.item():.6f}] "
-                        f"[Sun mean {mean} and sun cov {cov}]")
+            loss.backward()
+            optimizer.step()
+            mean = self.optimize_parameters['light_source_mean'].detach().cpu().tolist()
+            cov = self.optimize_parameters['light_source_covariance'].detach().cpu().tolist()
+            log.info(f"[Epoch {epoch} / {n_epochs}] [Loss: {loss.item():.8f}] "
+                    f"[Sun mean {mean} and sun cov {cov}]")
     
     def evaluate(self, pred_bitmaps):        
         
@@ -428,7 +430,7 @@ class FixRaytracer(torch.nn.Module):
             with torch.no_grad():
                 norm_true.append(normalize_images(true_bitmaps[:, h]))
             
-            losses.append(mse(norm_pred[h], norm_true[h]))
+            losses.append(dice_loss(norm_pred[h], norm_true[h]))
 
         save_bitmap(norm_true[0][0], save_bitmaps_dir, f"norm_true_0_8.png")
         
@@ -486,7 +488,7 @@ if __name__ == '__main__':
     # scenario = fixer.setup()
     
     # fixer.load_calibration_data(helio_to_calib_map)
-    output = fixer.optimize(100, learning_rate=1e-3)
+    output = fixer.optimize(100, learning_rate=1e-6)
     # print()
 
     
