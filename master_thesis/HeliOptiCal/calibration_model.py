@@ -89,6 +89,8 @@ class CalibrationModel(nn.Module):
         # self.save_directory = Path(self.name)
         self.tb_logger = None  # later set logger for present run
         
+        self.val_error_history = []  # log average mean validation error
+        
         self.device = general_config[my_config_dict.general_device]
     
         # Load the scenario
@@ -275,7 +277,7 @@ class CalibrationModel(nn.Module):
                     optimizer,
                     base_lr=cfg[my_config_dict.model_cycliclr_base_lr],
                     max_lr=cfg[my_config_dict.model_cycliclr_max_lr],
-                    step_size_up=[my_config_dict.model_cycliclr_step_size_up],
+                    step_size_up=cfg[my_config_dict.model_cycliclr_step_size_up],
                     mode=cfg[my_config_dict.model_cycliclr_mode],
                     gamma=cfg[my_config_dict.model_cycliclr_gamma],
                     cycle_momentum=False
@@ -288,6 +290,7 @@ class CalibrationModel(nn.Module):
                     factor=cfg[my_config_dict.model_reduce_on_plateau_factor],
                     patience=cfg[my_config_dict.model_reduce_on_plateau_patience],
                     threshold=cfg[my_config_dict.model_reduce_on_plateau_treshold],
+                    threshold_mode="abs",
                     min_lr=cfg[my_config_dict.model_reduce_on_plateau_min_lr],
                     verbose=False
                 )
@@ -359,7 +362,7 @@ class CalibrationModel(nn.Module):
             data_directory=dataset_config[my_config_dict.dataset_training_data_directory],
             heliostats_to_load=self.heliostat_ids,
             power_plant_position=self.scenario.power_plant_position,
-            load_flux_images=bool(self.use_raytracing),
+            load_flux_images=bool(dataset_config[my_config_dict.dataset_load_flux_images]),
             preload_flux_images=bool(dataset_config[my_config_dict.dataset_preload_flux_images]),
             is_simulated_data=bool(dataset_config[my_config_dict.dataset_training_data_was_simulated]),
             properties_file_ends_with=dataset_config[my_config_dict.dataset_properties_suffix],
@@ -375,9 +378,13 @@ class CalibrationModel(nn.Module):
         """ 
         device = torch.device(self.device if device is None else device)
         # Sum of scheduled epochs
-        sum_epochs = sum(self.run_config[my_config_dict.run_config_model][my_config_dict.model_epochs_sequence])
+        max_epochs = sum(self.run_config[my_config_dict.run_config_model][my_config_dict.model_epochs_sequence])
         log_steps = self.run_config[my_config_dict.run_config_general][my_config_dict.general_logging_steps]
-        tolerance = self.run_config[my_config_dict.run_config_general][my_config_dict.general_tolerance_mrad]
+        
+        # Settings for early stopping
+        early_stop = self.run_config[my_config_dict.run_config_general][my_config_dict.general_early_stop]
+        stop1 = early_stop[my_config_dict.general_tolerance_mrad]
+        stop2 = early_stop[my_config_dict.general_least_improvement_mrad]
         
         splits = self.datasplitter.splits
         for split_type in splits:
@@ -396,16 +403,15 @@ class CalibrationModel(nn.Module):
                 # Check, whether to perform phased learning / training
                 phased_learning_bool = bool(freeze_and_phase[my_config_dict.model_phase_param_learning])
                 phase_counter = 0  # required to track the phases for learning
-                               
-                epoch = 0
-                best_val_error = float('inf')
-                worst_error_across_field = float('inf')
+
+                # Empty validation error history
+                self.val_error_history = []
                 
                 # Log initial parameter state
                 self.tb_logger.log_parameters_obj(-1, self.learnable_params_dict)
                 
                 # Set early stopping if worst error drops below tolerance
-                while epoch < sum_epochs and worst_error_across_field > tolerance:
+                for epoch in range(max_epochs):
                     # Apply phased learning if configured
                     if phased_learning_bool:
                         phase_counter = self.phase_freeze_training(current_epoch=epoch, phase_counter=phase_counter)
@@ -442,37 +448,37 @@ class CalibrationModel(nn.Module):
                     if self.schedulers:
                         if isinstance(self.schedulers, torch.optim.lr_scheduler.ReduceLROnPlateau):
                             self.schedulers.step(val_loss)
-                            current_lr = current_lr = self.optimizer.param_groups[0]['lr']
+                            current_lr = self.optimizer.param_groups[0]['lr']
                         else:
                             self.schedulers.step()
                             current_lr = self.schedulers.get_last_lr()[0]
                     else:
-                        current_lr = current_lr = self.optimizer.param_groups[0]['lr']
+                        current_lr = self.optimizer.param_groups[0]['lr']
                     self.tb_logger.log_metric(epoch, 'BaseLearningRate', current_lr)
                     
-                    epoch += 1
                     if epoch % log_steps == 0:
-                        log.info(f"Epoch: {epoch} of {sum_epochs}, "
+                        log.info(f"Epoch: {epoch} of {max_epochs}, "
                          f"Train / Val Loss: {train_loss.item():.6f} / {val_loss.item():.6f}, "
                          f"Train / Val Avg.Error (mrad): {train_alignment_errors.mean().item():.2f} / {val_alignment_errors.mean().item():.2f}, "
                          f"LR: {current_lr: 8f}")
                     
-                    if val_alignment_errors.max().item() < worst_error_across_field:
-                        worst_error_across_field = val_alignment_errors.max().item()
-
+                    if self.check_early_stopping(val_alignment_errors, stop_1=stop1, stop_2=stop2):
+                        break  # break training loop if early stopping is triggered
+                        
                     # Save backup csv for every 100 epochs
                     if epoch % 100 == 0:
                         self.tb_logger.save_dataframes_to_csv()
                         
-                    # Clean up after yourself (seems necessary, otherwise CUDA out of memory error)
+                    # Delete some objects to save RAM (seems necessary, otherwise CUDA out of memory error)
                     torch.cuda.empty_cache()
+                    del train_loss
+                    del val_loss
                     del pred_flux_bitmaps
                     del val_pred_bitmaps
                     del field_orientations
                     del val_orientations
                     
                 # Testing
-                epoch -= 1  # keep epoch index consistent for logging purposes
                 self.eval()
                 split_ids_test = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'test', heliostat_ids=self.heliostat_ids)
                 self.tb_logger.set_mode("Test")
@@ -483,7 +489,7 @@ class CalibrationModel(nn.Module):
                 log.info(f"Finally: Test Avg.Error (mrad): {test_alignment_errors.mean().item():.2f}, Actual Avg.Error (mrad): {actual_alignment_errors.mean().item():.2f}")
                 
                 self.tb_logger.close()
-        
+     
     def forward(self, field_batch: List[Dict[str, Union[torch.Tensor, str]]], device: Optional[Union[torch.device, str]] = None):
         """
         Generate model output based on the given input data.
@@ -536,7 +542,7 @@ class CalibrationModel(nn.Module):
         
         # 1) Calculate model metric: Alignment Errors from True vs Pred Reflection Directions
         with torch.no_grad():  # re-calculate flux-centers as ``PAINT`` coordinates for flux centers were inconsistent
-            if self.use_raytracing:
+            if self.dataloader.load_flux_images:
                 true_flux_bitmaps = torch.stack([sample[my_config_dict.field_sample_flux_images] for sample in field_batch])
                 true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas)
             else:
@@ -571,7 +577,7 @@ class CalibrationModel(nn.Module):
         self.tb_logger.log_loss(f"AlignmentLoss_{loss_config[my_config_dict.general_loss_type]}", alignment_loss.mean().item(), epoch)
         
         # 3) Calculate the "actual" alignment errors if ideal flux center is known, ie. data was simulated
-        actual_alignment_errors = {}
+        actual_alignment_errors = torch.zeros_like(eval_alignment_errors)
         if self.dataloader.is_simulated_data:  # data should contain the ideal flux centers
             with torch.no_grad():
                 # Calculate the "actual" alignment errors based on the known reflection axis
@@ -589,8 +595,8 @@ class CalibrationModel(nn.Module):
             if bool(contour_config[my_config_dict.general_use_contour]): 
                 if  epoch > contour_config[my_config_dict.general_contour_warmup]:
                     # One loss term for fine alignment (requires overlap) and one for coarse alignment (no overlap of contours) 
-                    fine_contour_loss, coarse_contour_loss = self.calc_contour_loss(pred_flux_bitmaps, true_flux_bitmaps, epoch)
-                    combined_loss = self.soft_loss_transition(alignment_loss, fine_contour_loss, coarse_contour_loss, epoch) # [H_idx]
+                    fine_loss, coarse_loss, center_loss = self.calc_contour_loss(pred_flux_bitmaps, true_flux_bitmaps, target_areas, epoch)
+                    combined_loss = self.soft_loss_transition(alignment_loss, fine_loss, coarse_loss, center_loss, epoch) # [H_idx]
                     guardrail_loss = self.guardrail_loss(eval_alignment_errors, combined_loss, alignment_loss) # [H_idx]
                     self.tb_logger.log_loss(f"CombinedLoss", combined_loss.mean().item(), epoch)
                 self.tb_logger.log_loss(f"GuardrailLoss", guardrail_loss.mean().item(), epoch)
@@ -598,13 +604,52 @@ class CalibrationModel(nn.Module):
             # Log flux images
             # if epoch == 0:
             #     self.tb_logger.log_flux_bitmaps(epoch, true_flux_bitmaps, type='TrueFlux')
-            # if epoch % 100 == 0 or epoch == 0:                   
+            # if epoch % 50 == 0 or epoch == 0:                   
             #     self.tb_logger.log_flux_bitmaps(epoch, pred_flux_bitmaps, type='PredFlux')
             #     self.tb_logger.log_diff_flux_bitmaps(epoch, pred_flux_bitmaps, true_flux_bitmaps, type='DiffFlux')
         return guardrail_loss.mean(), eval_alignment_errors, actual_alignment_errors
-    
-    def soft_loss_transition(self, alignment_loss: torch.Tensor, fine_contour_loss: torch.Tensor, coarse_contour_loss: torch.Tensor, epoch: int,
-                             beta: float=0.5, gamma: float=0.1):
+
+    def check_early_stopping(self, val_alignment_errors: torch.Tensor, stop_1: 0.5, stop_2: 0.05):
+        """
+        Evaluate early stopping criteria based on validation alignment errors.
+        
+        Parameters
+        ----------
+        val_alignment_errors : torch.Tensor
+            Tensor of shape [B, H] with alignment errors in mrad.
+        epoch : int
+            Current training epoch.
+        stop_1 : float
+            Threshold value for worst-performing heliostat which triggers early stopping (Default: 0.5)
+        stop_2 : float
+            Threshold value for minimum improvement in mean validation error over last 100 epochs which triggers early stopping (Default: 0.05)
+            
+        Returns
+        -------
+        stop : bool
+            True if early stopping should be triggered.
+        """
+        # Compute mean alignment error per heliostat [H]
+        mean_error_per_heliostat = val_alignment_errors.mean(dim=0)  # shape: [H]
+        worst_heliostat_error = mean_error_per_heliostat.max().item()
+        mean_val_error = mean_error_per_heliostat.mean().item()
+        self.val_error_history.append(mean_val_error)
+
+        # Criterion 1: Worst individual heliostat below threshold
+        if worst_heliostat_error < stop_1:
+            log.info(f"Early stopping (1): Worst heliostat error ({worst_heliostat_error:.3f} mrad) is below threshold.")
+            return True
+
+        # Criterion 2: No sufficient improvement in last 100 epochs
+        if len(self.val_error_history) >= 500:
+            improvement = self.val_error_history[-500] - self.val_error_history[-1]
+            if improvement < stop_2 and stop_2 > 0:
+                log.info(f"Early stopping (2): Mean validation error did not improve by {stop_2} mrad over last 500 epochs (Δ={improvement:.4f}).")
+                return True
+        return False
+        
+    def soft_loss_transition(self, alignment_loss: torch.Tensor, fine_contour_loss: torch.Tensor, coarse_contour_loss: torch.Tensor, center_loss: torch.Tensor,
+                             epoch: int, beta: float=0.6, omega: float=0.15, gamma: float=0.2):
         """
         Combine three loss input Tensor to one single loss using a soft transition from alignment loss to contour loss terms.
         """ 
@@ -613,10 +658,11 @@ class CalibrationModel(nn.Module):
         assert alignment_loss.shape == coarse_contour_loss.shape, \
             f"Loss terms need to have equal shapes, but have {alignment_loss.shape}, {fine_contour_loss.shape}" 
                 
-        sum_epochs = sum(self.run_config[my_config_dict.run_config_model][my_config_dict.model_epochs_sequence])
+        max_epochs = sum(self.run_config[my_config_dict.run_config_model][my_config_dict.model_epochs_sequence])
         contour_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config][my_config_dict.general_contour_config]
+        use_center_loss = bool(contour_config[my_config_dict.general_use_center])
         warmup = contour_config[my_config_dict.general_contour_warmup]
-        half = (sum_epochs - warmup) / 2 + warmup
+        half = (max_epochs - warmup) / 2 + warmup
         
         # Make soft transition to contour loss terms in first half
         if epoch <= half:
@@ -625,17 +671,21 @@ class CalibrationModel(nn.Module):
             combined_loss = alpha * ((1-beta) * fine_contour_loss + beta * coarse_contour_loss) + (1 - alpha + gamma) * alignment_loss
         else: 
             combined_loss = (1-beta) * fine_contour_loss + beta * coarse_contour_loss +  gamma * alignment_loss
-        
+            
+        if use_center_loss:
+            combined_loss += omega * center_loss
+            self.tb_logger.log_loss(f"ContourLossCenters", center_loss.mean().item(), epoch)  
+                    
         # Log Losses
         fine_loss_key = contour_config[my_config_dict.general_contour_fine].upper()
         if fine_loss_key != "0":
             self.tb_logger.log_loss(f"ContourLoss{fine_loss_key}", fine_contour_loss.mean().item(), epoch)
         coarse_loss_key = contour_config[my_config_dict.general_contour_coarse].upper()
         if coarse_loss_key != "0":
-            self.tb_logger.log_loss(f"ContourLoss{coarse_loss_key}", coarse_contour_loss.mean().item(), epoch)        
+            self.tb_logger.log_loss(f"ContourLoss{coarse_loss_key}", coarse_contour_loss.mean().item(), epoch)                    
         return combined_loss
     
-    def guardrail_loss(self, alignment_errors: torch.Tensor, combined_loss: torch.Tensor, alignment_loss: torch.Tensor, threshold=8.0):
+    def guardrail_loss(self, alignment_errors: torch.Tensor, combined_loss: torch.Tensor, alignment_loss: torch.Tensor, threshold=10.0):
         """
         Use alignemnt_loss as fallback loss term if a Heliostat violates the threshold average alignment error.
         """
@@ -654,7 +704,6 @@ class CalibrationModel(nn.Module):
         # Apply fallback where alignment error too high
         guardrail_loss = torch.where(fallback_mask, alignment_loss, combined_loss)    
         return guardrail_loss
-    
         
     def calc_alignment_loss(self, cosine_similarities: torch.Tensor):
         """
@@ -712,8 +761,8 @@ class CalibrationModel(nn.Module):
         
         return loss_per_heliostat
     
-    def calc_contour_loss(self, pred_bitmaps: torch.Tensor, true_bitmaps: torch.Tensor, epoch,
-                          threshold=0.4, sharpness=60.0, num_interpolate=4, sigma_in=10.0, sigma_out=15.0):    
+    def calc_contour_loss(self, pred_bitmaps: torch.Tensor, true_bitmaps: torch.Tensor, target_areas, epoch, 
+                          threshold=0.6, sharpness=70.0, num_interpolate=4, sigma_in=15.0, sigma_out=25.0):    
         """
         Attempts to find upper contours of both predicted and true flux bitmaps. 
         Then calculate image loss on found contours per Heliostat.
@@ -738,10 +787,12 @@ class CalibrationModel(nn.Module):
         device = pred_bitmaps.device
         fine_loss_per_heliostat = torch.zeros(H, device=device)
         coarse_loss_per_heliostat = torch.zeros(H, device=device)
+        center_loss_per_heliostat = torch.zeros(H, device=device)
         
         # Get the contour loss configurations
         contour_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config][my_config_dict.general_contour_config]
         warmup = contour_config[my_config_dict.general_contour_warmup]
+        use_centers = bool(contour_config[my_config_dict.general_use_center])
         
         # Scale to similar magnitudes      
         loss_scaling = {"MSE": 1, "CHD": 1e-3, "SDF": 1e-1, "DICE": 1e-2}
@@ -755,6 +806,10 @@ class CalibrationModel(nn.Module):
             fine_loss_fnct = lambda x, y: mse_fnc(x, y) * loss_scaling[fine_loss_key]
         elif fine_loss_key == "DICE":
             fine_loss_fnct = lambda x, y: dice_loss(x, y) * loss_scaling[fine_loss_key]
+        elif "MSE" in fine_loss_key and "DICE" in fine_loss_key:
+            mse_fnc = torch.nn.MSELoss()
+            fine_loss_fnct = lambda x, y: (mse_fnc(x, y) * loss_scaling["MSE"] 
+                                           + dice_loss(x, y) * loss_scaling["DICE"])
         else: 
             raise ValueError(f"Unsupported type for fine contour loss: {fine_loss_key}")    
         
@@ -766,6 +821,9 @@ class CalibrationModel(nn.Module):
             coarse_loss_fnct = lambda x, y: chamfer_distance_batch_optimized(x, y) * loss_scaling[coarse_loss_key]
         elif coarse_loss_key == "SDF":
             coarse_loss_fnct = lambda x, y: sdf_loss(x, y) * loss_scaling[coarse_loss_key]
+        elif ("CHD" in coarse_loss_key and "SDF" in coarse_loss_key):
+            coarse_loss_fnct = lambda x, y: (chamfer_distance_batch_optimized(x, y) * loss_scaling["CHD"] 
+                                           + sdf_loss(x, y) * loss_scaling["SDF"])
         else: 
             raise ValueError(f"Unsupported type for coarse contour loss: {coarse_loss_key}")    
         
@@ -778,6 +836,9 @@ class CalibrationModel(nn.Module):
                 true_contours = self.find_upper_contour(true_bitmaps[:, h_idx], threshold, sharpness, num_interpolate, sigma_in, sigma_out)
             fine_loss_per_heliostat[h_idx] = fine_loss_fnct(pred_contours, true_contours).mean()
             coarse_loss_per_heliostat[h_idx] = coarse_loss_fnct(pred_contours, true_contours).mean()
+            if use_centers:
+                hel_target_areas = [sample[h_idx] for sample in target_areas]
+                center_loss_per_heliostat[h_idx] = self.calc_center_mass_loss(pred_contours, true_contours, hel_target_areas)
             with torch.no_grad():
                 all_pred_contours[:, h_idx] = pred_contours
                 all_true_contours[:, h_idx] = true_contours
@@ -785,11 +846,37 @@ class CalibrationModel(nn.Module):
         # Log contour images
         if epoch % 20 == 0 or epoch == (warmup + 1): # Log on initiation and every 100th epoch         
             self.tb_logger.log_flux_bitmaps(epoch, all_pred_contours - all_true_contours, type='DiffContour1', threshold=0)
-            # self.tb_logger.log_diff_flux_bitmaps(epoch, all_pred_contours, all_true_contours, type='DiffContour', normalize=True, threshold=0.0001)     
-            del all_pred_contours
-            del all_true_contours
+        #    self.tb_logger.log_diff_flux_bitmaps(epoch, all_pred_contours, all_true_contours, type='DiffContour', normalize=True, threshold=0.0001)     
+        del all_pred_contours
+        del all_true_contours
+        return fine_loss_per_heliostat, coarse_loss_per_heliostat, center_loss_per_heliostat
+    
+    def calc_center_mass_loss(self, images1: torch.Tensor, images2: torch.Tensor, target_areas_names: List[str], threshold=0):
+        """
+        Calculate the mean loss on center of mass corrdinates between the two input image batches.
+        """
+        assert images1.shape == images2.shape
+        device = images1.device
+        center_of_mass1 = []
+        center_of_mass2 = []
         
-        return fine_loss_per_heliostat, coarse_loss_per_heliostat
+        for i in range(images1.shape[0]):
+            target_area =  self.target_areas[target_areas_names[i]]
+            center_of_mass1.append(get_center_of_mass(bitmap=images1[i], 
+                                                      target_center=target_area.center,
+                                                      plane_e=target_area.plane_e,
+                                                      plane_u=target_area.plane_u,
+                                                      threshold=threshold,
+                                                      device=device))
+            center_of_mass2.append(get_center_of_mass(bitmap=images2[i], 
+                                                      target_center=target_area.center,
+                                                      plane_e=target_area.plane_e,
+                                                      plane_u=target_area.plane_u,
+                                                      threshold=threshold,
+                                                      device=device))
+        centers1_tensor = torch.stack(center_of_mass1)
+        centers2_tensor = torch.stack(center_of_mass2)
+        return torch.mean(torch.norm(centers1_tensor - centers2_tensor, dim=1))
            
     def calc_flux_centers_from_orientations(self, orientations: torch.Tensor, incident_ray_directions: torch.Tensor, target_area_names: List[List[str]]):
         """
@@ -918,7 +1005,7 @@ class CalibrationModel(nn.Module):
         
         # Calculate cosine-similarity
         dot_products = torch.sum(pred_vector * true_vector, dim=-1)
-        cos_sim = dot_products / (m1 * m2 + epsilon)  # avoid division by zero
+        cos_sim = (dot_products + epsilon) / (m1 * m2 + epsilon)  # avoid division by zero
         return cos_sim
     
     @staticmethod
@@ -943,15 +1030,17 @@ class CalibrationModel(nn.Module):
         
         # Calculate cosine-similarity
         dot_products = torch.sum(pred_vector * true_vector, dim=-1)
-        cos_sim = dot_products / (m1 * m2 + epsilon)  # avoid division by zero
+        cos_sim = (dot_products + epsilon) / (m1 * m2 + epsilon)  # avoid division by zero
         
-        eps_clamp = 1e-8  # Safe clamping with stable edges
-        angles_rad = torch.acos(torch.clamp(cos_sim, min= -1.0 + eps_clamp, max= 1.0 - eps_clamp))
-        angles_mrad = angles_rad * 1000
-        return angles_mrad
+        #  eps_clamp = 1e-12  # Safe clamping with stable edges
+        angles_rad = torch.acos(torch.clamp(cos_sim, min= -1.0, max= 1.0))
+        if torch.isnan(angles_rad).any():
+            log.warning("NaN detected in alignment errors tensor.")
+        
+        return angles_rad * 1000  # in mrad
 
     @staticmethod
-    def find_upper_contour(bitmaps: torch.Tensor, threshold=0.6, sharpness=80.0, num_interpolate=4, sigma_in=10.0, sigma_out=14.0):
+    def find_upper_contour(bitmaps: torch.Tensor, threshold=0.6, sharpness=70.0, num_interpolate=4, sigma_in=20.0, sigma_out=25.0):
         """
         Safely extract upper contours from flux bitmaps. Avoids in-place ops that break autograd.
         """
