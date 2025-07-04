@@ -81,14 +81,18 @@ class FixRaytracer(torch.nn.Module):
         
         self.data_batch = []
     
-    def initiate_parameters(self, mean=0.0, covariance=2 * 4.3681e-6):
+    def initiate_parameters(self, mean=0.0, cov=2 * 4.3681e-6):
+        device = self.device
         optimize_parameters = torch.nn.ParameterDict()
         optimize_parameters['light_source_mean'] = torch.nn.Parameter(
-            torch.tensor(mean, dtype=torch.float32, device=self.device), requires_grad=True
+            torch.tensor([mean, mean], dtype=torch.float64, device=self.device),
+                requires_grad=True
             )
         optimize_parameters['light_source_covariance'] = torch.nn.Parameter(
-            torch.tensor(covariance, dtype=torch.float32, requires_grad=True)
+            torch.tensor([[cov, 0], [0, cov]], dtype=torch.float64, device=self.device, 
+                         requires_grad=True)
             )
+        
         self.optimize_parameters = optimize_parameters
         return optimize_parameters
     
@@ -129,8 +133,8 @@ class FixRaytracer(torch.nn.Module):
                                                  light_source_type=config_dictionary.sun_key,
                                                  number_of_rays=number_of_rays,
                                                  distribution_type=distribution_type,
-                                                 mean=self.optimize_parameters['light_source_mean'].detach().item(),
-                                                 covariance=self.optimize_parameters['light_source_covariance'].detach().item())
+                                                 mean=mean,
+                                                 covariance=covariance)
         light_source_list_config = LightSourceListConfig(light_source_list=[light_source1_config])
         self.light_source_list_config = light_source_list_config
         return light_source_list_config
@@ -180,8 +184,7 @@ class FixRaytracer(torch.nn.Module):
         
         log.info(f"Loading one scenario from {scenario_h5_path}...")
         with h5py.File("/dss/dsshome1/05/di38kid/data/scenarios/20250525_scenario_20_heliostats.h5", "r") as scenario_file:
-            scenario = Scenario.load_scenario_from_hdf5(scenario_file=scenario_file, 
-                                                        device=self.device)   
+            scenario = Scenario.load_scenario_from_hdf5(scenario_file=scenario_file, device=self.device)   
         return scenario
 
     def infuse_parameters(self, scenario=None, distribution_parameters: Dict=None):
@@ -196,39 +199,20 @@ class FixRaytracer(torch.nn.Module):
         sun = scenario.light_sources.light_source_list[0]
         
         sun.distribution = distribution
-        # sun = Sun(self.number_of_rays,
-        #           {'distribution_type': 'normal',
-        #            'mean': distribution_parameters['light_source_mean'], 
-        #            'covariance': distribution_parameters['light_source_covariance']}, 
-        #           device=self.device)
-        # light_sources = LightSourceArray(light_source_list=[sun])
-
-        # scenario.light_sources = light_sources
         return scenario
     
     def build_distribution(self):
         
-        optimize_parameters = torch.nn.ParameterDict()
+        # optimize_parameters = torch.nn.ParameterDict()
         device = self.device
         
-        optimize_parameters['light_source_mean'] = torch.nn.Parameter(
-            torch.tensor([0.0, 0.0], dtype=torch.float, device=device), 
-            requires_grad=True
-            )
-        optimize_parameters['light_source_covariance'] = torch.nn.Parameter(
-            torch.tensor([[2 * 4.3681e-6, 0], [0, 2 * 4.3681e-6]], dtype=torch.float, device=device),
-            requires_grad=True
-            )
-        self.optimize_parameters = optimize_parameters
-        distribution = torch.distributions.MultivariateNormal(optimize_parameters['light_source_mean'], 
-                                                              optimize_parameters['light_source_covariance'])
+        distribution = torch.distributions.MultivariateNormal(self.optimize_parameters['light_source_mean'], 
+                                                              self.optimize_parameters['light_source_covariance'])
         return distribution
         
     def init_raytracer(self, scenario=None, bitmap_resolution=(256, 256)):
         
         if scenario is None:
-            if self.scenario is None:
-                self.scenario = self.load_scenario()
             scenario = self.scenario
             
         # Before raytracer setup, Heliostat field needs to be aligned
@@ -253,6 +237,7 @@ class FixRaytracer(torch.nn.Module):
         
         log.info("Begin setup...")
         scenario = self.load_scenario(scenario_h5_path)
+        # self.optimize_parameters = self.initiate_parameters()
         self.scenario = self.infuse_parameters(scenario)
         self.raytracer = self.init_raytracer(self.scenario)
         
@@ -328,8 +313,7 @@ class FixRaytracer(torch.nn.Module):
         if data_batch is None:
             data_batch = self.data_batch
         
-        # if self.raytracer is None:
-        #     self.setup()
+        self.setup()
         raytracer = self.raytracer
         
         heliostat_field = self.scenario.heliostat_field 
@@ -341,6 +325,7 @@ class FixRaytracer(torch.nn.Module):
         # all_bitmaps = torch.zeros([B, H, 256, 256], dtype=torch.float32, device=self.device)
         all_bitmaps = []
         
+        log.info("Raytracing...")
         for b, data in enumerate(data_batch):
             
             # Get the required data
@@ -354,14 +339,13 @@ class FixRaytracer(torch.nn.Module):
             # Use alignment based on incident rays, to get new motor positions    
             aim_points = torch.stack(data[my_config_dict.field_sample_flux_centers]) 
             kinematic.aim_points = aim_points
-            incident_ray_directions = torch.stack(incident_ray_directions)   
-            
-            with torch.no_grad():   
-                heliostat_field.align_surfaces_with_incident_ray_direction(
-                    incident_ray_direction=incident_ray_directions,
-                    round_motor_pos=False,
-                    device=self.device)
-                motor_positions = kinematic.motor_positions
+            incident_ray_directions = torch.stack(incident_ray_directions) 
+              
+            heliostat_field.align_surfaces_with_incident_ray_direction(
+                incident_ray_direction=incident_ray_directions,
+                round_motor_pos=False,
+                device=self.device)
+            motor_positions = kinematic.motor_positions
             
             bitmaps = align_and_raytrace(scenario=self.scenario,
                                          incident_ray_directions=incident_ray_directions,
@@ -384,28 +368,32 @@ class FixRaytracer(torch.nn.Module):
     def optimize(self, n_epochs: int=1000, learning_rate: float=1e-5):
         
         self.setup()
-        optimizer = torch.optim.Adam(self.optimize_parameters.parameters(), 
-                                     lr=learning_rate)
+        optimizer = torch.optim.Adam(self.optimize_parameters.parameters(), lr=learning_rate)
         helio_to_calib_map = self.get_map(5)
         data_batch = self.load_calibration_data(helio_to_calib_map)
         
-        # with torch.autograd.set_detect_anomaly(True):
-        for epoch in range(n_epochs):
-            
-            pred_bitmaps = self.forward(data_batch)
-            if epoch % 10 == 0:
-                save_bitmap(pred_bitmaps[0, 0], save_bitmaps_dir, f"pred_0_8_{epoch}.png")
+        with torch.autograd.set_detect_anomaly(True):
+            for epoch in range(n_epochs):
                 
-            loss = self.evaluate(pred_bitmaps)
-            optimizer.zero_grad()
-            # torch.autograd.set_detect_anomaly(True)
+                pred_bitmaps = self.forward(data_batch)
+                if epoch % 10 == 0:
+                    save_bitmap(pred_bitmaps[0, 0], save_bitmaps_dir, f"pred_0_8_{epoch}.png")
+                    
+                loss = self.evaluate(pred_bitmaps)
+                optimizer.zero_grad()
+                # torch.autograd.set_detect_anomaly(True)
 
-            loss.backward()
-            optimizer.step()
-            mean = self.optimize_parameters['light_source_mean'].detach().cpu().tolist()
-            cov = self.optimize_parameters['light_source_covariance'].detach().cpu().tolist()
-            log.info(f"[Epoch {epoch} / {n_epochs}] [Loss: {loss.item():.8f}] "
-                    f"[Sun mean {mean} and sun cov {cov}]")
+                self.optimize_parameters['light_source_mean'].retain_grad()
+                self.optimize_parameters['light_source_covariance'].retain_grad()
+                loss.backward()
+                print(self.optimize_parameters['light_source_mean'].grad)
+                print(self.optimize_parameters['light_source_covariance'].grad)
+                
+                optimizer.step()
+                mean = self.optimize_parameters['light_source_mean'].detach().cpu().tolist()
+                cov = self.optimize_parameters['light_source_covariance'].detach().cpu().tolist()
+                log.info(f"[Epoch {epoch} / {n_epochs}] [Loss: {loss.item():.8f}] "
+                        f"[Sun mean {mean} and sun cov {cov}]")
     
     def evaluate(self, pred_bitmaps):        
         
@@ -426,13 +414,13 @@ class FixRaytracer(torch.nn.Module):
         
         for h in range(pred_bitmaps.shape[1]):
             
-            norm_pred.append(normalize_images(pred_bitmaps[:, h]))
+            norm_pred = normalize_images(pred_bitmaps[:, h])
             with torch.no_grad():
-                norm_true.append(normalize_images(true_bitmaps[:, h]))
+                norm_true = normalize_images(true_bitmaps[:, h])
             
-            losses.append(dice_loss(norm_pred[h], norm_true[h]))
+            losses.append(mse(norm_pred, norm_true))
 
-        save_bitmap(norm_true[0][0], save_bitmaps_dir, f"norm_true_0_8.png")
+        save_bitmap(norm_true[0], save_bitmaps_dir, f"norm_true_0_0.png")
         
         loss = torch.stack(losses).mean()
         return loss
