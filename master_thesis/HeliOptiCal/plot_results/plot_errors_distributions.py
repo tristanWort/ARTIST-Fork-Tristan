@@ -108,9 +108,9 @@ def plot_alignment_errors_over_sun_pos(merged_data,
             cmap = plt.cm.viridis
         
         elif type == 'show_size':
-            markers = {'Train': 'o', 'Valid': 'o', 'Test': 'o'}
-            cmap = {'Train': 'green', 'Valid': 'blue', 'Test': 'red'}
-            marker_scaling = 50 / max_error
+            markers = {'Train': '*', 'Valid': 'o', 'Test': 'o'}
+            cmap = {'Train': 'black', 'Valid': 'blue', 'Test': 'red'}
+            marker_scaling = 20
         
         # For scatter plots or interpolation points
         for mode in modes:
@@ -119,8 +119,19 @@ def plot_alignment_errors_over_sun_pos(merged_data,
             
             if not mode_data.empty:
                 
-                if type=='show_size':
-                    for i, data in mode_data.iterrows():                        
+                if type=='show_size':                
+                    for i, data in mode_data.iterrows():  
+                               
+                        if mode == 'Train':
+                            # Plot black star for training samples
+                            ax.plot(data['azimuth'],
+                                    data['elevation'],
+                                    color=cmap[mode],
+                                    marker=markers[mode],
+                                    markersize=10,
+                                    )  
+                            continue  # Skip the rest for Train mode
+                                    
                         # Plot empty circles around data points
                         plot_error = 1.0
                         while plot_error <= (data['error'] + 1.0):
