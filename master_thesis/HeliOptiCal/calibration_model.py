@@ -9,6 +9,7 @@ import os
 import re
 import json
 import scipy
+import copy
 
 from datetime import datetime
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -245,6 +246,7 @@ class CalibrationModel(nn.Module):
         If one scheduler is defined, returns it directly.
         """
         optimizer = self.optimizer
+        initial_lr = model_config[my_config_dict.model_initial_lr]
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise TypeError(f"Expected optimizer to be an instance of "
                             f"torch.optim.Optimizer, but got {type(optimizer)}.")
@@ -282,6 +284,18 @@ class CalibrationModel(nn.Module):
                     gamma=cfg[my_config_dict.model_cycliclr_gamma],
                     cycle_momentum=False
                 )
+                
+            elif scheduler_type == "RampLR":
+                cfg = model_config[my_config_dict.model_ramplr]
+                final_lr = cfg[my_config_dict.model_cycliclr_max_lr]
+                step_up = cfg[my_config_dict.model_cycliclr_step_size_up]
+                def lr_lambda(epoch):
+                    if epoch < step_up: 
+                        # Linear increase until final_lr
+                        return (final_lr - initial_lr) / initial_lr * (epoch / step_up) + 1.0
+                    else:
+                        return final_lr / initial_lr
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
             elif scheduler_type == 'ReduceLROnPlateau':
                 cfg = model_config[my_config_dict.model_reduce_on_plateau]
@@ -406,6 +420,8 @@ class CalibrationModel(nn.Module):
 
                 # Empty validation error history
                 self.val_error_history = []
+                best_val_metric = float('inf')
+                best_state_dict = None
                 
                 # Log initial parameter state
                 self.tb_logger.log_parameters_obj(-1, self.learnable_params_dict)
@@ -428,7 +444,7 @@ class CalibrationModel(nn.Module):
                     # Backward
                     self.optimizer.zero_grad()
                     train_loss.backward()
-                    check_for_nan_grad(self.learnable_params_dict)
+                    nan_grad_detected = check_for_nan_grad(self.learnable_params_dict)
                     self.optimizer.step()
                     
                     # Log parameters
@@ -437,13 +453,14 @@ class CalibrationModel(nn.Module):
                     # Validation
                     self.eval()
                     split_ids_val = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'validation', heliostat_ids=self.heliostat_ids)
-                    self.tb_logger.set_mode("Valid")
+                    self.tb_logger.set_mode("Validation")
                     self.tb_logger.set_helio_and_calib_ids(split_ids_val)
                     with torch.no_grad():
                         data_batch_val = self.dataloader.get_field_batch(helio_and_calib_ids=split_ids_val, device=device)
                         val_orientations, val_pred_bitmaps = self.forward(data_batch_val)
                         val_loss, val_alignment_errors, _ = self.evaluate_model(epoch, val_orientations, val_pred_bitmaps, data_batch_val)
-                    
+                        best_val_metric, best_state_dict = self.update_best_parameters(best_val_metric, val_alignment_errors.mean(), best_state_dict)
+
                     # Step schedulers if not None
                     if self.schedulers:
                         if isinstance(self.schedulers, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -458,13 +475,13 @@ class CalibrationModel(nn.Module):
                     
                     if epoch % log_steps == 0:
                         log.info(f"Epoch: {epoch} of {max_epochs}, "
-                         f"Train / Val Loss: {train_loss.item():.6f} / {val_loss.item():.6f}, "
+                         f"Train / Val Loss: {train_loss.item():.8f} / {val_loss.item():.8f}, "
                          f"Train / Val Avg.Error (mrad): {train_alignment_errors.mean().item():.2f} / {val_alignment_errors.mean().item():.2f}, "
                          f"LR: {current_lr: 8f}")
                     
-                    if self.check_early_stopping(val_alignment_errors, stop_1=stop1, stop_2=stop2):
-                        break  # break training loop if early stopping is triggered
-                        
+                    if (self.check_early_stopping(val_alignment_errors, stop_1=stop1, stop_2=stop2) or torch.isnan(val_orientations).any() or nan_grad_detected):
+                        break  # break training loop if early stopping is triggered or parameters contain nan-gradients
+                    
                     # Save backup csv for every 100 epochs
                     if epoch % 100 == 0:
                         self.tb_logger.save_dataframes_to_csv()
@@ -479,6 +496,7 @@ class CalibrationModel(nn.Module):
                     del val_orientations
                     
                 # Testing
+                self.load_best_parameters(best_state_dict)
                 self.eval()
                 split_ids_test = self.datasplitter.get_helio_and_calib_ids_from_split(split_type, split_size, 'test', heliostat_ids=self.heliostat_ids)
                 self.tb_logger.set_mode("Test")
@@ -536,21 +554,34 @@ class CalibrationModel(nn.Module):
         target_areas = [sample[my_config_dict.field_sample_target_names] for sample in field_batch]
         incident_ray_directions = torch.stack([sample[my_config_dict.field_sample_incident_rays] for sample in field_batch])
         
+        # Load config for loss
+        loss_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config]
+        
         # All inputs must have the same batch size
         assert len(target_areas) == orientations.shape[0] == pred_flux_bitmaps.shape[0],\
             "Batch sizes must be equal for target_areas, orientations and pred_flux_bitmaps."
         
         # 1) Calculate model metric: Alignment Errors from True vs Pred Reflection Directions
-        with torch.no_grad():  # re-calculate flux-centers as ``PAINT`` coordinates for flux centers were inconsistent
-            if self.dataloader.load_flux_images:
-                true_flux_bitmaps = torch.stack([sample[my_config_dict.field_sample_flux_images] for sample in field_batch])
-                true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas)
-            else:
-                true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] for sample in field_batch])
+        # 1a) Ground-Truth centroid
+        with torch.no_grad(): 
+            if self.dataloader.is_simulated_data:  # training data was simulated and holds data for ideal centroid
+                true_ideal_flux_centers = torch.stack([sample[my_config_dict.field_sample_ideal_flux_centers] 
+                                                       for sample in field_batch])
+                true_ideal_reflection_directions = self.calc_reflection_directions_from_flux_centers(
+                        true_ideal_flux_centers, orientations)
             
+            if self.dataloader.load_flux_images:  # re-calculate flux-centers for true flux centroids as COM
+                true_flux_bitmaps = torch.stack([sample[my_config_dict.field_sample_flux_images] 
+                                                 for sample in field_batch])
+                true_flux_centers = self.calc_centers_of_mass(bitmaps=true_flux_bitmaps, target_area_names=target_areas, threshold=0.0)
+            else:  # use centroid coordinates from calibration config-files
+                true_flux_centers = torch.stack([sample[my_config_dict.field_sample_flux_centers] 
+                                                 for sample in field_batch])
+    
+        # 1b) Reflection Directions for Ground-Truth and Prediction
         true_reflection_directions = self.calc_reflection_directions_from_flux_centers(true_flux_centers, orientations)
         pred_reflection_directions = self.calc_reflection_directions_from_orientations(incident_ray_directions, orientations)
-        with torch.no_grad():
+        with torch.no_grad(): # for evaluation metric never use 'ideal' centroid as GT
             eval_alignment_errors = self.calc_alignment_errors_stable(pred_reflection_directions, true_reflection_directions)
             self.tb_logger.log_alignment_errors(epoch=epoch, alignment_errors=eval_alignment_errors)
         
@@ -558,16 +589,22 @@ class CalibrationModel(nn.Module):
         loss_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config]
         alignment_loss_basis = loss_config[my_config_dict.general_loss_basis].lower()
         
+        # 2a) re-calculate GT of reflection axis if set to "ideal"
+        if (loss_config[my_config_dict.general_loss_groundtruth] == "ideal"  # use ideal centroids in loss
+                and self.dataloader.is_simulated_data):
+                true_reflection_directions = true_ideal_reflection_directions
+                
         if "orientation" in alignment_loss_basis:
             cosine_similarities = self.calc_cosine_similarities(pred_reflection_directions, true_reflection_directions)
  
-        elif "center_of_mass" in alignment_loss_basis:
-            empty_mask, empty_count = self.count_empty_flux_predictions(pred_flux_bitmaps, epoch=epoch, threshold=1) 
-            fallback_reflections = self.calc_reflection_directions_from_orientations(incident_ray_directions=incident_ray_directions,
-                                                                                     orientations=orientations)  # needed for instances of empty flux bitmaps
-            mass_centers = self.calc_centers_of_mass(bitmaps=pred_flux_bitmaps, target_area_names=target_areas)
-            reflection_from_centers = self.calc_reflection_directions_from_flux_centers(mass_centers, orientations)
-            pred_reflection_directions = torch.where(empty_mask.unsqueeze(-1),  fallback_reflections, reflection_from_centers)
+        elif ("center_of_mass" in alignment_loss_basis) or ("com" in alignment_loss_basis):
+            empty_mask, empty_count = self.count_empty_flux_predictions(pred_flux_bitmaps, epoch=epoch, threshold=1)
+            mass_centers = self.calc_centers_of_mass(bitmaps=pred_flux_bitmaps, target_area_names=target_areas, threshold=0.0)
+            pred_reflection_directions = self.calc_reflection_directions_from_flux_centers(mass_centers, orientations)
+            if empty_count > 0:  # use fallback meachnism if any flux predictions are empty
+                fallback_reflections = self.calc_reflection_directions_from_orientations(
+                    incident_ray_directions=incident_ray_directions, orientations=orientations)
+                pred_reflection_directions = torch.where(empty_mask.unsqueeze(-1),  fallback_reflections, pred_reflection_directions)
             cosine_similarities = self.calc_cosine_similarities(pred_reflection_directions, true_reflection_directions)
                    
         else:
@@ -581,10 +618,7 @@ class CalibrationModel(nn.Module):
         if self.dataloader.is_simulated_data:  # data should contain the ideal flux centers
             with torch.no_grad():
                 # Calculate the "actual" alignment errors based on the known reflection axis
-                true_flux_centers = torch.stack([sample[my_config_dict.field_sample_ideal_flux_centers] for sample in field_batch])
-                true_reflection_directions = self.calc_reflection_directions_from_flux_centers(true_flux_centers, orientations)
-                actual_alignment_errors = self.calc_alignment_errors_stable(pred_reflection_directions, true_reflection_directions)
-        
+                actual_alignment_errors = self.calc_alignment_errors_stable(pred_reflection_directions, true_ideal_reflection_directions)
             self.tb_logger.log_alignment_errors(epoch=epoch, alignment_errors=actual_alignment_errors, is_actual=True)
         
         # 4) Calculate Image-based Loss if this is configured 
@@ -601,12 +635,6 @@ class CalibrationModel(nn.Module):
                     self.tb_logger.log_loss(f"CombinedLoss", combined_loss.mean().item(), epoch)
                 self.tb_logger.log_loss(f"GuardrailLoss", guardrail_loss.mean().item(), epoch)
                 
-            # Log flux images
-            # if epoch == 0:
-            #     self.tb_logger.log_flux_bitmaps(epoch, true_flux_bitmaps, type='TrueFlux')
-            # if epoch % 50 == 0 or epoch == 0:                   
-            #     self.tb_logger.log_flux_bitmaps(epoch, pred_flux_bitmaps, type='PredFlux')
-            #     self.tb_logger.log_diff_flux_bitmaps(epoch, pred_flux_bitmaps, true_flux_bitmaps, type='DiffFlux')
         return guardrail_loss.mean(), eval_alignment_errors, actual_alignment_errors
 
     def check_early_stopping(self, val_alignment_errors: torch.Tensor, stop_1: 0.5, stop_2: 0.05):
@@ -649,7 +677,7 @@ class CalibrationModel(nn.Module):
         return False
         
     def soft_loss_transition(self, alignment_loss: torch.Tensor, fine_contour_loss: torch.Tensor, coarse_contour_loss: torch.Tensor, center_loss: torch.Tensor,
-                             epoch: int, beta: float=0.6, omega: float=0.15, gamma: float=0.2):
+                             epoch: int, beta: float=0.6, omega: float=0.05, gamma: float=0.2):
         """
         Combine three loss input Tensor to one single loss using a soft transition from alignment loss to contour loss terms.
         """ 
@@ -685,7 +713,7 @@ class CalibrationModel(nn.Module):
             self.tb_logger.log_loss(f"ContourLoss{coarse_loss_key}", coarse_contour_loss.mean().item(), epoch)                    
         return combined_loss
     
-    def guardrail_loss(self, alignment_errors: torch.Tensor, combined_loss: torch.Tensor, alignment_loss: torch.Tensor, threshold=10.0):
+    def guardrail_loss(self, alignment_errors: torch.Tensor, combined_loss: torch.Tensor, alignment_loss: torch.Tensor, threshold=8.0):
         """
         Use alignemnt_loss as fallback loss term if a Heliostat violates the threshold average alignment error.
         """
@@ -844,14 +872,14 @@ class CalibrationModel(nn.Module):
                 all_true_contours[:, h_idx] = true_contours
             
         # Log contour images
-        if epoch % 20 == 0 or epoch == (warmup + 1): # Log on initiation and every 100th epoch         
+        if epoch % 50 == 0 or epoch == (warmup + 1): # Log on initiation and every 100th epoch         
             self.tb_logger.log_flux_bitmaps(epoch, all_pred_contours - all_true_contours, type='DiffContour1', threshold=0)
         #    self.tb_logger.log_diff_flux_bitmaps(epoch, all_pred_contours, all_true_contours, type='DiffContour', normalize=True, threshold=0.0001)     
         del all_pred_contours
         del all_true_contours
         return fine_loss_per_heliostat, coarse_loss_per_heliostat, center_loss_per_heliostat
     
-    def calc_center_mass_loss(self, images1: torch.Tensor, images2: torch.Tensor, target_areas_names: List[str], threshold=0):
+    def calc_center_mass_loss(self, images1: torch.Tensor, images2: torch.Tensor, target_areas_names: List[str], threshold=0.1):
         """
         Calculate the mean loss on center of mass corrdinates between the two input image batches.
         """
@@ -1209,5 +1237,31 @@ class CalibrationModel(nn.Module):
             
             # Move to next epoch sequence in lr scheduler
             epoch_accumulator += epochs
-            
+
+    def update_best_parameters(self, best_metric: float, current_metric: torch.Tensor, best_state_dict: dict()):
+        """
+        Update the best_state_dict with the current model parameters if current_metric is better.
         
+        Args: 
+            best_metric (float): The best value of the validation metric so far (lower is better).
+            current_metric (torch.Tensor): The current epoch's validation metric (lower is better).
+            best_state_dict (dict): The current best model parameters (state_dict).
+
+        Returns:
+            best_metric (float): Updated best metric.
+            best_state_dict (dict): Updated state_dict for the best model.
+        """
+        if not torch.isnan(current_metric) and (current_metric.item() < best_metric):
+            best_metric = current_metric.item()
+            best_state_dict = copy.deepcopy(self.state_dict())
+        return best_metric, best_state_dict
+
+    def load_best_parameters(self, best_state_dict):
+        """
+        Load the best set of parameters into the model.
+        
+        Args:
+            best_state_dict (dict): The best parameters (from .state_dict()) to load.
+        """
+        if best_state_dict is not None:
+            self.load_state_dict(best_state_dict)

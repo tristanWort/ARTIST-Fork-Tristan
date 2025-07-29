@@ -1,25 +1,202 @@
 {
-    "run": {
-        "scenario_path": "/dss/dsshome1/05/di38kid/data/scenarios/20250325_scenario_7heliostats.h5",
-        "heliostats": ["AA39", "AC27", "AD43", "AM35", "BB72", "BG24"],
-        "paint_dir": "/dss/dsshome1/05/di38kid/data/paint/", 
-        "num_epochs": 150,
-        "use_raytracing": 0,
-        "random_seed": 7,
+    "notes": [
+        "base",
+        "updated kinematics configuration, contour image-based and extended training no early stopping"
+    ],
+    "general": {
+        "name": "20_Heliostats",
+        "scenario_path": "/dss/dsshome1/05/di38kid/data/scenarios/20250525_scenario_20_heliostats.h5",
+        "save_to_directory": "/dss/dsshome1/05/di38kid/data/results/runs",
+        "use_raytracing_bool": 1,
+        "loss_config": {
+            "loss_for_alignment": "MSE",
+            "ground-truth": "non-ideal",
+            "alignment_loss_basis": "orientation",
+            "upper_contour_config": {
+                "use_upper_contour_bool": 1,
+                "use_after_n_epochs": 100,
+                "use_centers_of_mass": 1,
+                "fine_alignment_with": "DICE",
+                "coarse_alignment_with": "SDF"
+            }
+        },
+        "early_stopping": {
+            "tolerance_mrad": 0.5,
+            "least_improvement_mrad": 0.00
+        },
+        "introduce_random_errors_bool": 1,
+        "logging_steps": 1,
+        "random_seed": 42,
         "device": "cuda:0"
     },
-    "model": {
-        "init_learning_rate": [0.0001],
-        "parameter_grouping": [],
-        "optimizer_type": "Adam",
-        "scheduler_type": "ReduceLROnPlateau",
-        "max_lr": 0.1
+    "dataset": {
+        "training_data_directory": "/dss/dsshome1/05/di38kid/data/simulated_data/20Heliostats_01/20Heliostats_with_blocking_60_on_3rd",
+        "training_data_was_simualted_bool": 1,
+        "path_to_metadata": "/dss/dsshome1/05/di38kid/data/paint/selected_20/metadata/calibration_metadata_selected_heliostats_20250525_161028.csv",
+        "load_flux_images_bool": 1,
+        "preload_flux_images_bool": 1,
+        "training_sizes": [
+            30
+        ],
+        "validation_sizes": [
+            30
+        ],
+        "split_types": [
+            "knn"
+        ],
+        "properties_file_ends_with": "-calibration-properties.json",
+        "flux_file_ends_with": "-flux.png",
+        "device": "cuda:0"
     },
-    "splits": {
-        "path_to_measurements": "/dss/dsshome1/05/di38kid/data/paint/metadata/calibration_metadata_selected_heliostats_20250325_150310.csv",
-        "output_dir": "/dss/dsshome1/05/di38kid/data/results",
-        "training_sizes": [30],
-        "validation_sizes": [30],
-        "split_types": ["knn"]
+    "model_settings": {
+        "optimizer_type": "Adam",
+        "initial_lr": 0.0001,
+        "weight_decay": 0.0,
+        "scheduler_sequence": [
+            "ReduceLROnPlateau"
+        ],
+        "epochs_sequence": [
+            1000
+        ],
+        "SGD": {
+            "momentum": 0.9,
+            "nesterov": 1
+        },
+        "RMSprop": {
+            "alpha": 0.99,
+            "momentum": 0.9,
+            "centered": 0
+        },
+        "Adam": {
+            "betas": [
+                0.9,
+                0.999
+            ]
+        },
+        "AdamW": {
+            "betas": [
+                0.9,
+                0.999
+            ]
+        },
+        "Adadelta": {
+            "rho": 0.9
+        },
+        "ConstantLR": {
+            "lr_factor": 1.0
+            },
+        "CyclicLR": {
+            "base_lr": 0.0001,
+            "max_lr": 0.005,
+            "step_size_up": 3000,
+            "mode": "triangular",
+            "gamma": 1.0
+        },
+        "RampLR": {
+            "base_lr": 0.0001,
+            "max_lr": 0.003,
+            "step_size_up": 3000
+        },
+        "ReduceLROnPlateau": {
+            "reduction_factor": 0.5,
+            "patience": 50,
+            "min_lr": 1e-06,
+            "threshold": 0.0
+        },
+        "apply_with_caution": {
+            "phase_parameter_learning_bool": 0,
+            "phase_parameter_groups_by_keywords": [
+                [
+                    "translation",
+                    "heliostat"
+                ],
+                [
+                    "tilt"
+                ],
+                [
+                    "actuators"
+                ]
+            ],
+            "length_of_phases_per_sequence": [
+                5,
+                5
+            ],
+            "freeze_parameters_for_training": []
+        }
+    },
+    "introduce_random_errors_to_scenario": {
+        "all_heliostats_position_params": {
+            "heliostat_e": 0.1,
+            "heliostat_n": 0.1,
+            "heliostat_u": 0.1
+        },
+        "all_deviations_params": {
+            "first_joint_translation_e": 0.05,
+            "first_joint_translation_n": 0.05,
+            "first_joint_translation_u": 0.05,
+            "second_joint_translation_e": 0.05,
+            "second_joint_translation_n": 0.05,
+            "second_joint_translation_u": 0.05,
+            "concentrator_translation_e": 0.05,
+            "concentrator_translation_n": 0.05,
+            "concentrator_translation_u": 0.05,
+            "first_joint_tilt_n": 0.005,
+            "first_joint_tilt_u": 0.005,
+            "second_joint_tilt_e": 0.005,
+            "second_joint_tilt_n": 0.005,
+            "concentrator_tilt_e": 0.005,
+            "concentrator_tilt_n": 0.005,
+            "concentrator_tilt_u": 0.005
+        },
+        "all_actuators_params": {
+            "actuators_increments": 0,
+            "actuators_initial_stroke_lengths": 0.00,
+            "actuators_offsets": 0.005,
+            "actuators_pivot_radii": 0.005,
+            "actuators_initial_angles": 0.001
+        }
+    },
+    "HELP_READ_ONLY": {
+        "available_optimizers": [
+            "SGD",
+            "RMSprop",
+            "Adam",
+            "AdamW",
+            "Adadelta"
+        ],
+        "available_learning_rate_schedulers": [
+            "ConstantLR",
+            "ReduceLROnPlateau",
+            "RampLR",
+            "CyclicLR"
+        ],
+        "available_parameters_for_copy_and_paste_above": [
+            "heliostat_e",
+            "heliostat_n",
+            "heliostat_u",
+            "first_joint_translation_e",
+            "first_joint_translation_n",
+            "first_joint_translation_u",
+            "second_joint_translation_e",
+            "second_joint_translation_n",
+            "second_joint_translation_u",
+            "concentrator_translation_e",
+            "concentrator_translation_n",
+            "concentrator_translation_u",
+            "first_joint_tilt_e",
+            "first_joint_tilt_n",
+            "first_joint_tilt_u",
+            "second_joint_tilt_e",
+            "second_joint_tilt_n",
+            "second_joint_tilt_u",
+            "concentrator_tilt_e",
+            "concentrator_tilt_n",
+            "concentrator_tilt_u",
+            "actuators_increments",
+            "actuators_initial_stroke_lengths",
+            "actuators_offsets",
+            "actuators_pivot_radii",
+            "actuators_initial_angles"
+        ]
     }
 }
