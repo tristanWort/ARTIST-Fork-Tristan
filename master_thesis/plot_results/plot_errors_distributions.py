@@ -65,7 +65,7 @@ def merge_data(alignment_errors_df, sun_positions_df):
     
     return merged_df
 
-def plot_alignment_errors(merged_data, 
+def plot_alignment_errors_over_sun_pos(merged_data, 
                           output_dir, 
                           average_errors=None,
                           type=Literal['show_size', 'show_color_gradient'], 
@@ -101,15 +101,15 @@ def plot_alignment_errors(merged_data,
         max_error = heliostat_data['error'].max()
         
         if type == 'show_color_gradient':
-            markers = {'Train': 'o', 'Validation': 's', 'Test': '^'}
+            markers = {'Train': 'o', 'Valid': 's', 'Test': '^'}
             # Calculate global min/max for colormap normalization
             # Define markers for different mode
             norm = colors.Normalize(vmin=min_error, vmax=max_error)
             cmap = plt.cm.viridis
         
         elif type == 'show_size':
-            markers = {'Train': 'o', 'Validation': 'o', 'Test': 'o'}
-            cmap = {'Train': 'green', 'Validation': 'blue', 'Test': 'red'}
+            markers = {'Train': 'o', 'Valid': 'o', 'Test': 'o'}
+            cmap = {'Train': 'green', 'Valid': 'blue', 'Test': 'red'}
             marker_scaling = 50 / max_error
         
         # For scatter plots or interpolation points
@@ -210,7 +210,7 @@ def plot_alignment_errors(merged_data,
         title = f'Errors for Heliostat {heliostat_id} '
         if average_errors is not None:
             for mode, error in average_errors[heliostat_id].items():
-                rounded_error = round(error['error'], 2)
+                rounded_error = round(error['error'], 4)
                 title += str(f'{mode} Avg: {rounded_error} mrad ')
         ax.set_title(title)
         
@@ -226,6 +226,137 @@ def plot_alignment_errors(merged_data,
         plt.close(fig)
         
         print(f"Plot for heliostat {heliostat_id} saved to {output_dir}")
+   
+def plot_error_histograms(merged_data, output_dir, bin_width=0.1):
+    
+    """
+    Generate histogram plots of alignment error distributions for each heliostat.
+    
+    Args:
+        merged_data: DataFrame with merged alignment errors and sun positions
+        output_dir: Directory to save plots
+        bin_width: Width of histogram bins in mrad (default: 0.1)
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get unique heliostat IDs
+    heliostat_ids = merged_data['heliostat_id'].unique()
+    
+    # Define colors for different modes
+    mode_colors = {'Train': 'green', 'Validation': 'blue', 'Test': 'red'}
+    
+    for heliostat_id in heliostat_ids:
+        # Filter data for this heliostat
+        heliostat_data = merged_data[merged_data['heliostat_id'] == heliostat_id]
+        
+        # Get unique modes for this heliostat
+        modes = heliostat_data['mode'].unique()
+        
+        # Calculate global min/max for all modes to ensure consistent x-axis
+        min_error = heliostat_data['error'].min()
+        max_error = heliostat_data['error'].max()
+        
+        # Add a small buffer to the max value to ensure all points are visible
+        max_error = max_error * 1.05
+        
+        # Calculate number of bins based on range and bin width
+        num_bins = int(np.ceil((max_error - min_error) / bin_width))
+        
+        # Create bins with specified width
+        bins = np.arange(min_error, max_error + bin_width, bin_width)
+        
+        # Create figure with subplots (one row per mode)
+        # Make the figure wider to accommodate the statistics table on the right
+        fig, axs = plt.subplots(len(modes), 1, figsize=(16, 3 * len(modes)), sharex=True)
+        
+        # If there's only one mode, axs will not be an array
+        if len(modes) == 1:
+            axs = [axs]
+        
+        # Plot histogram for each mode
+        for i, mode in enumerate(modes):
+            mode_data = heliostat_data[heliostat_data['mode'] == mode]
+            
+            if not mode_data.empty:
+                # Plot histogram
+                counts, edges, bars = axs[i].hist(
+                    mode_data['error'], 
+                    bins=bins,
+                    alpha=0.7,
+                    color=mode_colors.get(mode, 'gray'),
+                    edgecolor='black',
+                    linewidth=1
+                )
+                
+                # Add value labels above each bar
+                for j, (count, x) in enumerate(zip(counts, edges[:-1])):
+                    if count > 0:  # Only add label if bar has data
+                        axs[i].text(
+                            x + bin_width/2,  # Center of the bar
+                            count + 0.1,      # Slightly above the bar
+                            str(int(count)),  # Integer count
+                            ha='center',
+                            va='bottom',
+                            fontsize=8
+                        )
+                
+                # Calculate statistics for this mode
+                mean_error = mode_data['error'].mean()
+                median_error = mode_data['error'].median()
+                std_dev = mode_data['error'].std()
+                
+                # Add vertical lines for mean and median
+                axs[i].axvline(mean_error, color='red', linestyle='-', linewidth=2, label=f'Mean: {mean_error:.4f} mrad')
+                axs[i].axvline(median_error, color='blue', linestyle='--', linewidth=2, label=f'Median: {median_error:.4f} mrad')
+                
+                # Add vertical dotted line at mean + 2 standard deviations
+                upper_bound = mean_error + 2 * std_dev
+                axs[i].axvline(upper_bound, color='purple', linestyle=':', linewidth=1.5, 
+                              label=f'Mean + 2σ: {upper_bound:.4f} mrad')
+                
+                # Add text with statistics - outside the plot area
+                stats_text = (f"Statistics for {mode} mode:\n\n"
+                              f"Count: {len(mode_data)}\n"
+                              f"Mean: {mean_error:.4f} mrad\n"
+                              f"Median: {median_error:.4f} mrad\n"
+                              f"Std Dev: {std_dev:.4f} mrad\n"
+                              f"Mean + 2σ: {upper_bound:.4f} mrad")
+                
+                # Create a text table outside the main plot area
+                # Adjust the position if needed based on your preference
+                props = dict(boxstyle='round', facecolor='white', alpha=0.9)
+                
+                # The coordinates are relative to the figure, not the axes
+                # Position the text to the right of the plot
+                fig.text(0.85, 0.85 - i * (1/len(modes)), stats_text, 
+                        verticalalignment='top', horizontalalignment='center',
+                        fontsize=10, bbox=props)
+            
+            # Set title and labels for each subplot
+            axs[i].set_title(f'{mode} Errors')
+            axs[i].set_ylabel('Frequency')
+            axs[i].grid(True, linestyle='--', alpha=0.7)
+            
+            # Place legend inside the plot area in the upper left
+            axs[i].legend(loc='upper right')
+        
+        # Set common x-label for all subplots
+        axs[-1].set_xlabel('Alignment Error (mrad)')
+        
+        # Set common title for the figure
+        fig.suptitle(f'Error Distribution for Heliostat {heliostat_id}', fontsize=16)
+        
+        # Adjust layout - use a tighter layout for the plots but leave room for stats table
+        plt.subplots_adjust(right=0.75)  # Leave 25% of the figure width for the stats tables
+        fig.tight_layout(rect=[0, 0, 0.75, 0.97])  # Leave space for the suptitle and stats tables
+        
+        # Save the figure
+        fig_path = os.path.join(output_dir, f'{heliostat_id}_error_histogram.png')
+        fig.savefig(fig_path, dpi=300)
+        plt.close(fig)
+        
+        print(f"Error histogram for heliostat {heliostat_id} saved to {fig_path}")
 
 def analyze_heliostat_field(tensorboard_path, metadata_file, output_dir):
     """
@@ -240,14 +371,14 @@ def analyze_heliostat_field(tensorboard_path, metadata_file, output_dir):
     
     # Extract alignment errors from tensorboard
     print("Extracting alignment errors from tensorboard...")
-    heliostat_ids = ['AA39', 'AC27', 'AD43', 'AM35', 'BB72', 'BG24']
+    # heliostat_ids = ['AA39', 'AC27', 'AD43', 'AM35', 'BB72', 'BG24']
     alignment_errors = get_all_alignment_errors(tensorboard_path, 
                                                 last_epoch_only=True,
-                                                heliostat_ids=heliostat_ids)
+                                                )
 
     print("Extracting average errors from tensorboard...")
     average_errors = dict()
-    for heliostat_id in heliostat_ids:
+    for heliostat_id in alignment_errors['heliostat_id'].unique():
         average_errors[heliostat_id] = get_average_errors(tensorboard_path, heliostat_id)
     
     # Load sun position data
@@ -260,7 +391,9 @@ def analyze_heliostat_field(tensorboard_path, metadata_file, output_dir):
     
     # Generate plots
     print("Generating plots...")
-    plot_alignment_errors(merged_data, output_dir, average_errors=average_errors, type='show_size', interpolate=False)
+    plot_alignment_errors_over_sun_pos(merged_data, output_dir, average_errors=average_errors, type='show_size', interpolate=False)
+    
+    plot_error_histograms(merged_data, output_dir, bin_width=0.1)
     
     print(f"Analysis complete. Plots saved to {output_dir}")
     
@@ -269,9 +402,10 @@ def analyze_heliostat_field(tensorboard_path, metadata_file, output_dir):
 
 # Example usage:
 if __name__ == "__main__":
-    tensorboard_path = "/dss/dsshome1/05/di38kid/data/results/tensorboard/run_2504011544_AA39.AC27.AD43.AM35.BB72.BG24"
+    tensorboard_path = "/dss/dsshome1/05/di38kid/data/results/runs/run_2505150058_six_heliostats/logs/knn_(30, 30)"
     metadata_file = "/dss/dsshome1/05/di38kid/data/paint/metadata/calibration_metadata_selected_heliostats_20250325_150310.csv"
-    output_dir = "/dss/dsshome1/05/di38kid/data/results/plots/errors_over_sun_positions/run_2504011544_AA39.AC27.AD43.AM35.BB72.BG24"
-    
+    output_dir = "/dss/dsshome1/05/di38kid/data/results/runs/run_2505150058_six_heliostats/plots"
+
     analyze_heliostat_field(tensorboard_path, metadata_file, output_dir)
+
     
