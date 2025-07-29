@@ -272,7 +272,7 @@ class RigidBody(Kinematic):
         self,
         incident_ray_direction: torch.Tensor,
         round_motor_pos: bool = False,  # TODO: Check if this destroys the computational graph.
-        max_num_iterations: int = 2,
+        max_num_iterations: int = 50,
         min_eps: float = 0.0001,
         device: Union[torch.device, str] = "cuda",
     ) -> torch.Tensor:
@@ -498,13 +498,13 @@ class RigidBody(Kinematic):
             The aligned surface normals.
         """
         device = torch.device(device)
-
-        orientations = self.incident_ray_direction_to_orientation(
-            incident_ray_direction,
-            max_num_iterations=10, 
-            round_motor_pos=round_motor_pos, 
-            device=device
-        )
+        with torch.no_grad():
+            orientations = self.incident_ray_direction_to_orientation(
+                incident_ray_direction,
+                max_num_iterations=10, 
+                round_motor_pos=round_motor_pos, 
+                device=device
+            )
         self.orientations = orientations
 
         aligned_surface_points = surface_points @ orientations.transpose(1, 2)

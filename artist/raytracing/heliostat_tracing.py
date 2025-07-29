@@ -247,6 +247,7 @@ class HeliostatRayTracer:
         rank: int = 0,
         batch_size: int = 1,
         random_seed: int = 7,
+        shuffle: bool=False,
         bitmap_resolution_e: int = 256,
         bitmap_resolution_u: int = 256,
     ) -> None:
@@ -284,7 +285,8 @@ class HeliostatRayTracer:
         self.world_size = world_size
         self.rank = rank
         self.batch_size = batch_size
-
+        self.random_seed = random_seed
+        
         # TODO: maybe this is not really optimial to just take the size of the first heliostat for everything
         self.number_of_surface_points_per_heliostat = (
             self.scenario.heliostat_field.all_current_aligned_surface_points.shape[1]
@@ -292,10 +294,10 @@ class HeliostatRayTracer:
 
         # Create distortions dataset.
         self.distortions_dataset = DistortionsDataset(
-            light_source=scenario.light_sources.light_source_list[0],
+            light_source=self.scenario.light_sources.light_source_list[0],
             number_of_points_per_heliostat=self.number_of_surface_points_per_heliostat,
             number_of_heliostats=self.scenario.heliostat_field.number_of_heliostats,  # distortians need to be loaded for each helisotat separately
-            random_seed=random_seed,
+            random_seed=self.random_seed,
         )
         # Create restricted distributed sampler.
         self.distortions_sampler = RestrictedDistributedSampler(
@@ -306,8 +308,8 @@ class HeliostatRayTracer:
         # Create dataloader.
         self.distortions_loader = DataLoader(
             self.distortions_dataset,
-            batch_size=batch_size,
-            shuffle=False,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
             sampler=self.distortions_sampler,
         )
 
