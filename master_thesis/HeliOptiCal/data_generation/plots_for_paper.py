@@ -96,10 +96,10 @@ def align_and_raytrace(scenario,
                                        bitmap_resolution_u=512,
                                        random_seed=seed) 
         # Raytrace and store bitmaps
-        bitmaps = raytracer.trace_rays_separate(incident_ray_directions=incident_ray_directions,
-                                                      target_areas=target_areas,
-                                                      device=device)
-        # bitmaps = raytracer.normalize_bitmaps(bitmaps, target_areas)
+        #bitmaps = raytracer.trace_rays_separate(incident_ray_directions=incident_ray_directions,
+        #                                              target_areas=target_areas,
+        #                                              device=device)
+        bitmaps = raytracer.normalize_bitmaps(bitmaps, target_areas)
         
         return bitmaps
     
@@ -256,7 +256,7 @@ for shading in shadings:
             #     device=device
             #     ))
             
-            bitmap = apply_artificial_blocking(bitmap, block_ratio=shading / 100, threshold=0.01, sigma=4.0)
+            bitmap = apply_artificial_blocking(bitmap, block_ratio=shading / 100, threshold=0.1, sigma=4.0)
             
             center_of_mass = utils.get_center_of_mass(
                                 bitmap=bitmap,

@@ -122,7 +122,8 @@ def plot_center_cross(center_indices: (int, int), cross_size: int = 20, cross_co
     )
     
 
-def save_bitmap_with_center_crosses(bitmap: torch.Tensor, center_indices: (int, int), save_under: Path, tight_layout=True, cross_legend=True, title=None):
+def save_bitmap_with_center_crosses(bitmap: torch.Tensor, center_indices: (int, int), save_under: Path, 
+                                    tight_layout=True, cross_legend=True, title=None, offset=None):
     """
     Save a bitmap image with a red cross marking the predicted center.
 
@@ -147,23 +148,26 @@ def save_bitmap_with_center_crosses(bitmap: torch.Tensor, center_indices: (int, 
     
     plt.plot(
     center_indices[0][1], center_indices[0][0],
-    color='red', marker='x', markersize=30,
+    color='red', marker='x', markersize=40, markeredgewidth=3
     )
-    plot_center_cross(center_indices[1], cross_color='blue', cross_size=20)
+    plot_center_cross(center_indices[1], cross_color='yellow', cross_size=40, cross_linewidth=3)
     # plt.plot(
     #     center_indices[1][1], center_indices[1][0],
     #     color='blue', marker='x', markersize=20,
     # )
-    plt.plot([], [], color='red', marker='x', linestyle='None', markersize=14, label='Unit Prediction of Centroid')
-    plt.plot([], [], color='blue', marker='x', linestyle='None', markersize=14, label='Ideal Centroid on Reflection Axis')
+    if cross_legend:
+        plt.plot([], [], color='red', marker='x', linestyle='None', markersize=24, markeredgewidth=3, label='Center-of-Mass')
+        plt.plot([], [], color='yellow', marker='x', linestyle='None', markersize=24, markeredgewidth=3, label='Projected Reflection Axis')
 
+    if offset is not None and offset > 1.0:
+        plt.plot([], [], color='white', linestyle='None', markersize=0, label=rf'$\theta = {offset:.2f}$ mrad')
+        
     if title:
         plt.title(title, fontsize=18, pad=10)
         pad_inches=0.12
     else:
         pad_inches=0
-    if cross_legend:
-        plt.legend(loc='upper right', fontsize=14)
+    plt.legend(loc='lower left', fontsize=28)
     plt.axis("off")
     
     if tight_layout:
@@ -171,151 +175,154 @@ def save_bitmap_with_center_crosses(bitmap: torch.Tensor, center_indices: (int, 
     else:
         plt.savefig(save_under, dpi=dpi)
     plt.close()
+
+
+if __name__ == '__main__':
     
+    
+    # Set up logger
+    set_logger_config()
 
-# Set up logger
-set_logger_config()
+    # Set the device
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
 
-# Set the device
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# device = torch.device("cpu")
-
-# Specify the path to your scenario.h5 file.
-scenario_path = pathlib.Path(
-    "/dss/dsshome1/05/di38kid/data/scenarios/250129-1347_scenario_AA39.h5"
-)
-
-# Specify the path for saving the generated data
-save_dir = Path("/dss/dsshome1/05/di38kid/data/simulated_data/SPIE_PAPER/surface_imperfections")
-os.makedirs(save_dir, exist_ok=True)
-
-# Specify path to paint-data
-paint_path = pathlib.Path("/dss/dsshome1/05/di38kid/data/paint")
-
-# Load two scenarios.
-with h5py.File(scenario_path) as scenario_file:
-    scenario_AA39 = Scenario.load_scenario_from_hdf5(
-        scenario_file=scenario_file, device=device
+    # Specify the path to your scenario.h5 file.
+    scenario_path = pathlib.Path(
+        "/dss/dsshome1/05/di38kid/data/scenarios/250129-1347_scenario_AA39.h5"
     )
 
-scenario_path = pathlib.Path(
-    "/dss/dsshome1/05/di38kid/data/scenarios/20250325_scenario_six_heliostats.h5"
-)
-with h5py.File(scenario_path) as scenario_file:
-    scenario_six_heliostats = Scenario.load_scenario_from_hdf5(
-        scenario_file=scenario_file, device=device
-    )
+    # Specify the path for saving the generated data
+    save_dir = Path("/dss/dsshome1/05/di38kid/data/simulated_data/SPIE_PAPER/surface_imperfections/20")
+    os.makedirs(save_dir, exist_ok=True)
 
-six_heliostats_field =  scenario_six_heliostats.heliostat_field
-six_positions = scenario_six_heliostats.heliostat_field.all_heliostat_positions
-six_kinematic = six_heliostats_field.rigid_body_kinematic
+    # Specify path to paint-data
+    paint_path = pathlib.Path("/dss/dsshome1/05/di38kid/data/paint/selected_20")
 
-AA39_heliostat_field = scenario_AA39.heliostat_field 
-AA39_kinematic = AA39_heliostat_field.rigid_body_kinematic
-
-# Get the list of all heliostats in the field
-all_heliostat_ids = scenario_six_heliostats.heliostat_field.all_heliostat_names
-print('heliostats in field:')
-print(all_heliostat_ids)
-
-# for h_idx, heliostat in enumerate(all_heliostat_ids):
-#     six_heliostats_field.all_surface_normals[h_idx] = AA39_heliostat_field.all_surface_normals[0]
-#     six_heliostats_field.all_surface_points[h_idx] = AA39_heliostat_field.all_surface_points[0]
-
-# Perform datasplits
-data_splitter = CalibrationDataSplitter(
-    metadata_path="/dss/dsshome1/05/di38kid/data/paint/metadata/calibration_metadata_selected_heliostats_20250325_150310.csv",
-    output_directory=save_dir / 'splits',
-)  
-data_splitter.perform_splits(
-    training_sizes=[30],
-    validation_sizes=[30],
-    split_types=["knn"],
-    save_splits_plots=False
-)
-splits = data_splitter.splits
-split_df = splits['knn'][(30, 30)]
-helio_and_calib_ids = {heliostat_id: split_df.loc[split_df[mappings.HELIOSTAT_ID] == heliostat_id].index.tolist()
-                       for heliostat_id in all_heliostat_ids}
-
-# Configure dataloader
-calibration_data_loader = CalibrationDataLoader(
-    data_directory=paint_path,
-    heliostats_to_load=all_heliostat_ids,
-    power_plant_position=scenario_AA39.power_plant_position,
-    load_flux_images=False,
-    preload_flux_images=False,
-    device=device
-)
-
-# Get the calibration data as a batch   
-batch = calibration_data_loader.get_field_batch(helio_and_calib_ids=helio_and_calib_ids, device=device)
-                         
-for n_sample, data in enumerate(batch[:1]):
-        
-    print(f"Running sample {n_sample}/{len(batch)}...")
-    
-    # Get the required data
-    calibration_ids = data[my_config_dict.field_sample_calibration_ids]
-    sun_elevations = data[my_config_dict.field_sample_sun_elevations]
-    sun_azimuths = data[my_config_dict.field_sample_sun_azimuths]
-    incident_ray_directions = data[my_config_dict.field_sample_incident_rays]
-    target_area_names = data[my_config_dict.field_sample_target_names]
-    target_area = scenario_six_heliostats.get_target_area(target_area_names[0])
-    
-    aim_points = []
-    target_areas = []
-    for heliostat in all_heliostat_ids:
-        target_areas.append(target_area)
-        aim_points.append(target_area.center)
-    aim_points = torch.stack(aim_points)
-
-    # Set aimpoints to flux center
-    six_kinematic.aim_points = aim_points
-    
-    # Use alignment based on incident rays, to get new motor positions
-    six_heliostats_field.align_surfaces_with_incident_ray_direction(
-        incident_ray_direction=incident_ray_directions,
-        round_motor_pos=False,
-        device=device
+    # Load two scenarios.
+    with h5py.File(scenario_path) as scenario_file:
+        scenario_AA39 = Scenario.load_scenario_from_hdf5(
+            scenario_file=scenario_file, device=device
         )
-    
-    with torch.no_grad():
-        bitmaps = align_and_raytrace(scenario=scenario_six_heliostats,
-                                    incident_ray_directions=incident_ray_directions,
-                                    target_areas=target_areas,
-                                    aim_points=aim_points,
-                                    align_with_motor_positions=False,
-                                    seed=global_seed,
+
+    scenario_path = pathlib.Path(
+        "/dss/dsshome1/05/di38kid/data/scenarios/20250525_scenario_20_heliostats.h5"
+    )
+    with h5py.File(scenario_path) as scenario_file:
+        scenario_six_heliostats = Scenario.load_scenario_from_hdf5(
+            scenario_file=scenario_file, device=device
+        )
+
+    six_heliostats_field =  scenario_six_heliostats.heliostat_field
+    six_positions = scenario_six_heliostats.heliostat_field.all_heliostat_positions
+    six_kinematic = six_heliostats_field.rigid_body_kinematic
+
+    AA39_heliostat_field = scenario_AA39.heliostat_field 
+    AA39_kinematic = AA39_heliostat_field.rigid_body_kinematic
+
+    # Get the list of all heliostats in the field
+    all_heliostat_ids = scenario_six_heliostats.heliostat_field.all_heliostat_names
+    print('heliostats in field:')
+    print(all_heliostat_ids)
+
+    # for h_idx, heliostat in enumerate(all_heliostat_ids):
+    #     six_heliostats_field.all_surface_normals[h_idx] = AA39_heliostat_field.all_surface_normals[0]
+    #     six_heliostats_field.all_surface_points[h_idx] = AA39_heliostat_field.all_surface_points[0]
+
+    # Perform datasplits
+    data_splitter = CalibrationDataSplitter(
+        metadata_path="/dss/dsshome1/05/di38kid/data/paint/selected_20/metadata/calibration_metadata_selected_heliostats_20250525_161028.csv",
+        output_directory=save_dir / 'splits',
+    )  
+    data_splitter.perform_splits(
+        training_sizes=[30],
+        validation_sizes=[30],
+        split_types=["knn"],
+        save_splits_plots=False
+    )
+    splits = data_splitter.splits
+    split_df = splits['knn'][(30, 30)]
+    helio_and_calib_ids = {heliostat_id: split_df.loc[split_df[mappings.HELIOSTAT_ID] == heliostat_id].index.tolist()
+                        for heliostat_id in all_heliostat_ids}
+
+    # Configure dataloader
+    calibration_data_loader = CalibrationDataLoader(
+        data_directory=paint_path,
+        heliostats_to_load=all_heliostat_ids,
+        power_plant_position=scenario_AA39.power_plant_position,
+        load_flux_images=False,
+        preload_flux_images=False,
+        device=device
+    )
+
+    # Get the calibration data as a batch   
+    batch = calibration_data_loader.get_field_batch(helio_and_calib_ids=helio_and_calib_ids, device=device)
+                            
+    for n_sample, data in enumerate(batch[:1]):
+            
+        print(f"Running sample {n_sample}/{len(batch)}...")
+        
+        # Get the required data
+        calibration_ids = data[my_config_dict.field_sample_calibration_ids]
+        sun_elevations = data[my_config_dict.field_sample_sun_elevations]
+        sun_azimuths = data[my_config_dict.field_sample_sun_azimuths]
+        incident_ray_directions = data[my_config_dict.field_sample_incident_rays]
+        target_area_names = data[my_config_dict.field_sample_target_names]
+        target_area = scenario_six_heliostats.get_target_area(target_area_names[0])
+        
+        aim_points = []
+        target_areas = []
+        for heliostat in all_heliostat_ids:
+            target_areas.append(target_area)
+            aim_points.append(target_area.center)
+        aim_points = torch.stack(aim_points)
+
+        # Set aimpoints to flux center
+        six_kinematic.aim_points = aim_points
+        
+        # Use alignment based on incident rays, to get new motor positions
+        six_heliostats_field.align_surfaces_with_incident_ray_direction(
+            incident_ray_direction=incident_ray_directions,
+            round_motor_pos=False,
+            device=device
+            )
+        
+        with torch.no_grad():
+            bitmaps = align_and_raytrace(scenario=scenario_six_heliostats,
+                                        incident_ray_directions=incident_ray_directions,
+                                        target_areas=target_areas,
+                                        aim_points=aim_points,
+                                        align_with_motor_positions=False,
+                                        seed=global_seed,
+                                        device=device
+                                        )
+        
+        orientations = six_kinematic.orientations
+        for h, heliostat_id in enumerate(all_heliostat_ids):
+            
+            cal_id = int(calibration_ids[h])
+            
+            bitmap = bitmaps[h]
+            
+            og_center_of_mass = utils.get_center_of_mass(
+                                    bitmap=bitmap,
+                                    target_center=target_area.center,
+                                    plane_e=target_area.plane_e,
+                                    plane_u=target_area.plane_u,
                                     device=device
-                                    )
-    
-    orientations = six_kinematic.orientations
-    for h, heliostat_id in enumerate(all_heliostat_ids):
-        
-        cal_id = int(calibration_ids[h])
-        
-        bitmap = bitmaps[h]
-        
-        og_center_of_mass = utils.get_center_of_mass(
-                                bitmap=bitmap,
-                                target_center=target_area.center,
-                                plane_e=target_area.plane_e,
-                                plane_u=target_area.plane_u,
-                                device=device
-                            )
-        
-        og_indices = get_bitmap_indices_from_center_coordinates(bitmap, og_center_of_mass, target_area.center, target_area.plane_e, target_area.plane_u, device)
-        
-        surface_normal = orientations[h, 0:4, 2]
-        reflected_ray = raytracing_utils.reflect(incident_ray_directions[h], surface_normal)
-        ideal_center_point, t = calculate_intersection(orientations[h, 0:4, 3], reflected_ray, target_area.center, target_area.normal_vector)
-        
-        print("Distance from Heliostat to Target =", t.item(), "m")        
-        ideal_indices = get_bitmap_indices_from_center_coordinates(bitmap, ideal_center_point, target_area.center, target_area.plane_e, target_area.plane_u, device)
-        save_bitmap_with_center_crosses(bitmap, [og_indices, ideal_indices], save_dir / f'{heliostat_id}_error_of_center_of_mass__title_and_legend.png', 
-                                        tight_layout=True, cross_legend=True, title=f'Heliostat Distance from Target: {t.item() :.2f} m')
-        save_bitmap_with_center_crosses(bitmap, [og_indices, ideal_indices], save_dir / f'{heliostat_id}_error_of_center_of_mass__legend.png', 
-                                        cross_legend=True, tight_layout=True)
-        save_bitmap_with_center_crosses(bitmap, [og_indices, ideal_indices], save_dir / f'{heliostat_id}_error_of_center_of_mass__raw.png', 
-                                        cross_legend=False, tight_layout=True)
+                                )
+            
+            og_indices = get_bitmap_indices_from_center_coordinates(bitmap, og_center_of_mass, target_area.center, target_area.plane_e, target_area.plane_u, device)
+            
+            surface_normal = orientations[h, 0:4, 2]
+            reflected_ray = raytracing_utils.reflect(incident_ray_directions[h], surface_normal)
+            ideal_center_point, t = calculate_intersection(orientations[h, 0:4, 3], reflected_ray, target_area.center, target_area.normal_vector)
+            
+            print("Distance from Heliostat to Target =", t.item(), "m")        
+            ideal_indices = get_bitmap_indices_from_center_coordinates(bitmap, ideal_center_point, target_area.center, target_area.plane_e, target_area.plane_u, device)
+            # save_bitmap_with_center_crosses(bitmap, [og_indices, ideal_indices], save_dir / f'{heliostat_id}_error_of_center_of_mass__title_and_legend.png', 
+            #                                 tight_layout=True, cross_legend=True, title=f'Heliostat Distance from Target: {t.item() :.2f} m')
+            # save_bitmap_with_center_crosses(bitmap, [og_indices, ideal_indices], save_dir / f'{heliostat_id}_error_of_center_of_mass__legend.png', 
+            #                                 cross_legend=True, tight_layout=True)
+            save_bitmap_with_center_crosses(bitmap, [og_indices, ideal_indices], save_dir / f'{heliostat_id}_error_of_center_of_mass__raw.png', 
+                                            cross_legend=False, tight_layout=True)
