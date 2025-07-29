@@ -1,4 +1,6 @@
 import argparse
+from datetime import datetime
+
 from pathlib import Path
 from paint.util import set_logger_config
 import paint.util.paint_mappings as mappings
@@ -11,7 +13,11 @@ from paint.data.stac_client import StacClient
 set_logger_config()
 
 # Data will be downloaded to this path.
-download_path = Path(r"/dss/dsshome1/05/di38kid/data/paint")
+download_path = Path(r"/dss/dsshome1/05/di38kid/data/paint/selected_20")
+selected_20 = [
+    "AA39", "AA26", "AE32", "AF46", "AH30",  "AM35", "AO51", "AP41", "AP30", "AX39", 
+    "AZ52", "BA41", "BA73", "BB37", "BC28", "BC34", "BC62", "BD40", "BF27", "BG50"
+    ]
 
 # Read in arguments for command line passing.
 parser = argparse.ArgumentParser()
@@ -25,20 +31,20 @@ parser.add_argument(
 )
 
 # Add arguments to the parser specifying the weather data sources.
-# parser.add_argument(
-#     "--weather_data_sources",
-#     type=str,
-#     help="List of data sources to use for weather data.",
-#     nargs="+",
-#     choices=["Jülich", "DWD"],
-#     default=["Jülich", "DWD"],
-# )
+parser.add_argument(
+    "--weather_data_sources",
+    type=str,
+    help="List of data sources to use for weather data.",
+    nargs="+",
+    choices=["Jülich", "DWD"],
+    default=["Jülich", "DWD"],
+)
 
 # Add arguments to the parser specifying the start date for filtering the data.
 # parser.add_argument(
 #     "--start_date",
 #     type=str,
-#     help="End date for filtering the data.",
+#      help="End date for filtering the data.",
 #     default="2023-01-01Z00:00:00Z",
 # )
 
@@ -56,7 +62,7 @@ parser.add_argument(
     type=str,
     help="List of heliostats to be downloaded.",
     nargs="+",
-    default=["AA39", "AC27", "AD43", "AM35", "BB72", "BG24"],
+    default=selected_20,
 )
 
 # Add arguments to the parser specifying the collections to be downloaded.
@@ -70,7 +76,10 @@ parser.add_argument(
         mappings.SAVE_CALIBRATION.lower(),
         mappings.SAVE_PROPERTIES.lower(),
     ],
-    default=["deflectometry", "calibration", "properties"]
+    default=[
+        "deflectometry", 
+        "calibration", 
+        "properties"]
 )
 
 # Add arguments to the parser specifying the calibration items to download.
@@ -86,7 +95,10 @@ parser.add_argument(
         mappings.CALIBRATION_PROPERTIES_KEY,
         mappings.CALIBRATION_CROPPED_IMAGE_KEY,
     ],
-    default=["calibration_properties", "flux_image"],
+    default=[
+        "calibration_properties", 
+        "flux_image"
+            ],
 )
 
 args = parser.parse_args()
@@ -95,7 +107,7 @@ args = parser.parse_args()
 client = StacClient(output_dir=args.output_dir)
 
 # Download the tower measurements.
-client.get_tower_measurements()
+# client.get_tower_measurements()
 
 # Download the weather data within the given time period.
 # client.get_weather_data(
@@ -105,12 +117,15 @@ client.get_tower_measurements()
 # )
 
 # Download heliostat data for the given heliostats, the specified collections and calibration items.
-client.get_heliostat_data(
-    heliostats=args.heliostats,
-    collections=args.collections,
-    filtered_calibration_keys=args.filtered_calibration,
-)
+# client.get_heliostat_data(
+#     heliostats=args.heliostats,
+#     collections=args.collections,
+#     filtered_calibration_keys=args.filtered_calibration,
+#  ) 
 
 # Download metadata for all heliostats. Will not be used in this script.
 # WARNING: Running the following command with 'heliostats=None' will take a very long time!
-client.get_heliostat_metadata(heliostats=["AA39", "AC27", "AD43", "AM35", "BB72", "BG24"])
+client.get_heliostat_metadata(
+    #heliostats=selected_20, 
+    collections=["properties"]
+    )
