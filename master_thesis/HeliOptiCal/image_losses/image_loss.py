@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn.functional as funct
 import torchvision.transforms as transforms
@@ -12,21 +13,25 @@ import time
 import matplotlib.pyplot as plt
 
 
-def distance_transform_tensor(mask: torch.Tensor):
+def distance_transform_tensor(mask: torch.Tensor, threshold: float = 0.1):
     """
-    Compute Euclidean distance transform of a binary mask for each sample in the batch.
-    Assumes mask is (B, 1, H, W).
+    Compute Euclidean distance transform for each mask in batch. Assumes input shape (B, 1, H, W).
     """
-    masks_np = mask.cpu().numpy()
+    masks_np = mask.detach().cpu().numpy()
     dist_maps = []
     for m in masks_np:
-        m_bin = (m > 0.1).astype(np.uint8).squeeze(0)
-        dist_map = scipy.ndimage.distance_transform_edt(1 - m_bin)  # distance to nearest foreground
+        m_bin = (m > threshold).astype(np.uint8).squeeze(0)
+        dist_map = scipy.ndimage.distance_transform_edt(1 - m_bin)
         dist_maps.append(dist_map)
-    return torch.tensor(dist_maps, dtype=torch.float32, device=mask.device).unsqueeze(1)
+    
+    # Convert list of arrays to single np.array before torch conversion
+    dist_maps_np = np.stack(dist_maps, axis=0)  # shape: (B, H, W)
+    dist_maps_tensor = torch.from_numpy(dist_maps_np).to(dtype=torch.float32, device=mask.device)
+
+    return dist_maps_tensor.unsqueeze(1)  # shape: (B, 1, H, W)
 
 
-def sdf_loss(pred_contour: torch.Tensor, target_contour: torch.Tensor):
+def sdf_loss(pred_contour: torch.Tensor, target_contour: torch.Tensor, threshold: float = 0.1):
     """
     Penalizes predicted contour pixels based on distance from ground truth.
     """
@@ -36,7 +41,7 @@ def sdf_loss(pred_contour: torch.Tensor, target_contour: torch.Tensor):
         target_contour = target_contour.unsqueeze(1)
         
     # Distance transform on the target (constant for backprop)
-    dist_map = distance_transform_tensor(target_contour.detach())  # shape (B, 1, H, W)
+    dist_map = distance_transform_tensor(target_contour.detach(), threshold)  # shape (B, 1, H, W)
     
     # Element-wise product (penalize predicted pixels farther from target)
     loss = (pred_contour * dist_map).mean()
@@ -61,8 +66,15 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
     torch.Tensor
         Dice loss averaged over the batch
     """
+    pred = torch.clamp(pred, 0, 1)
+    target = torch.clamp(target, 0, 1)
+    if pred.dim() == 3: pred = pred.unsqueeze(1)
+    if target.dim() == 3: target = target.unsqueeze(1)
+    
     pred_flat = pred.view(pred.size(0), -1)
     target_flat = target.view(target.size(0), -1)
+    if torch.isnan(pred_flat).any() or torch.isnan(target_flat).any():
+        raise ValueError(f"NaNs in input to dice_loss: pred={pred_flat}, target={target_flat}")
 
     intersection = (pred_flat * target_flat).sum(dim=1)
     denominator = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
@@ -111,68 +123,48 @@ def contour_difference(predictions, targets, threshold=0.5, sharpness=20.0):
     
     return difference_maps
 
-def find_soft_contour_pytorch_vertical(tensor_img, threshold=0.5, sharpness=20.0):
+
+def find_soft_contour_pytorch_vertical(tensor_img: torch.Tensor, threshold: float = 0.5, sharpness: float = 20.0):
     """
-    Differentiable contour extraction for vertical edges. Two convolutions are applied.
-    First a Sobel kernel is used for edge detection. Then contours are extracted via soft erosion.
-
-    Parameters:
-   - tensor_img: Tensor with shape (1, H, W) or (H, W), values ∈ [0, 1]
-    - threshold: Threshold for "soft" binarization
-    - sharpness: Steepness of the soft threshold (higher ≈ sharper)
-
-    Returns:
-    - Soft contour mask (1, H, W), values ∈ [0, 1]
+    Differentiable contour extraction using vertical Sobel filter and soft erosion.
+    Returns shape: (1, 1, H, W)
     """
-    if tensor_img.dim() == 2:  # if batch size is missing
-        tensor_img = tensor_img.unsqueeze(0)  # → (1, H, W)
 
-    # First perform convolution for edge detection.
-    # Define a Sobel kernel for vertical edge detection
+    # Normalize input shape
+    if tensor_img.dim() == 2:
+        tensor_img = tensor_img.unsqueeze(0)  # (1, H, W)
+    elif tensor_img.dim() != 3 or tensor_img.shape[0] != 1:
+        raise ValueError(f"Expected shape (H, W) or (1, H, W), got {tensor_img.shape}")
+
+    # Prepare for conv2d
+    tensor_img = tensor_img.unsqueeze(0)  # → (1, 1, H, W)
+
+    # --- Vertical Edge Detection ---
     sobel_kernel = torch.tensor(
         [[-1, -2, -1],
-        [0, 0, 0],
-        [1, 2, 1]],
-        device=tensor_img.device).float().view(1, 1, 3, 3)
+         [ 0,  0,  0],
+         [ 1,  2,  1]],
+        dtype=torch.float32,
+        device=tensor_img.device
+    ).view(1, 1, 3, 3)
 
-    # Define a vertical edge detection kernel
-    '''
-    kernel = torch.tensor([[1, 0, -1], 
-                        [2, 0, -2], 
-                        [1, 0, -1]], device=tensor_img.device).float().view(1, 1, 3, 3)
-    '''
+    edge_input = (tensor_img - threshold) * sharpness  # shape: (1, 1, H, W)
+    edge_padded = F.pad(edge_input, (1, 1, 1, 1), mode='replicate')
+    grad_out = F.conv2d(edge_padded, sobel_kernel)  # (1, 1, H, W)
+    vertical_mask = torch.sigmoid(grad_out)  # vertical edges
 
-    # Apply padding to maintain dimensions
-    padded = funct.pad(((tensor_img - threshold) * sharpness).unsqueeze(0), (1, 1, 1, 1), mode='replicate')  # (1, 1, H+2, W+2)
+    # --- Soft Erosion ---
+    binary = torch.sigmoid((tensor_img - threshold) * sharpness)  # (1, 1, H, W)
+    erosion_kernel = torch.ones((1, 1, 3, 3), device=tensor_img.device) / 9.0
+    erosion_padded = F.pad(binary, (1, 1, 1, 1), mode='replicate')
+    neighborhood_mean = F.conv2d(erosion_padded, erosion_kernel)  # (1, 1, H, W)
 
-    # Compute the vertical gradient
-    grad_out = funct.conv2d(padded, sobel_kernel).squeeze(0)  # → (1, H, W)
-
-    # Apply sigmoid function to get the mask for vertical edges
-    mask = torch.sigmoid(grad_out)
-
-    # Secondly, perform soft erosion for contour detection.
-    # Soft Thresholding (Sigmoid instead of hard threshold)
-    binary = torch.sigmoid((tensor_img - threshold) * sharpness)  # ∈ (0,1)
-
-    # "Soft Erosion" via mean of the 3x3 neighborhood
-    kernel = torch.ones((1, 1, 3, 3), device=tensor_img.device) / 9.0
-
-    # Apply padding to maintain dimensions
-    padded = funct.pad(binary.unsqueeze(0), (1, 1, 1, 1), mode='replicate')  # (1, 1, H+2, W+2)
-
-    # Compute the mean of the 3x3 neighborhood
-    neighborhood_mean = funct.conv2d(padded, kernel).squeeze(0)  # → (1, H, W)
-
-    # Difference between center and neighborhood → contour measure
     contour_strength = binary - neighborhood_mean
+    soft_contour = torch.sigmoid(contour_strength * sharpness)  # (1, 1, H, W)
+    soft_contour = torch.clamp((soft_contour - 0.5) * 2, 0, 1)  # [0, 1]
 
-    # Soft contour mask via Sigmoid (differentiable)
-    soft_contour = (torch.sigmoid(contour_strength * sharpness) - 0.5) * 2
-
-    # Clamp values to [0, 1]
-    soft_contour = soft_contour.clamp(0, 1)
-    return soft_contour * mask  # Values in [0,1], Shape: (1, H, W)
+    # Final soft vertical contour
+    return soft_contour * vertical_mask  # shape: (1, 1, H, W)
 
 
 def dist_loss_image_batch(pred_images: torch.Tensor, true_images: torch.Tensor, threshold: int = 0.1):

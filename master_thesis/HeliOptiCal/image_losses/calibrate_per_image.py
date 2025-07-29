@@ -163,12 +163,13 @@ def save_bitmap_with_center_cross(bitmap: torch.Tensor, center_indices: Tuple[in
     plt.close()
 
 
-def save_bitmaps_as_gif(bitmaps: [torch.Tensor], true_center_indices: (int, int), pred_center_indices_list: [Tuple], save_under: Path):
+def save_bitmaps_as_gif(bitmaps: [torch.Tensor], save_under: Path, true_center_indices=None, pred_center_indices_list=None):
     fig, ax = plt.subplots()
     im = ax.imshow(bitmaps[0], cmap="gray")
     ax.axis("off")
     
-    plot_center_cross(true_center_indices, cross_color='green')
+    if true_center_indices is not None:
+        plot_center_cross(true_center_indices, cross_color='green')
     
     # Initialize predicted center cross
     pred_hline, = ax.plot([], [], color='red', linewidth=1.5)
@@ -176,17 +177,18 @@ def save_bitmaps_as_gif(bitmaps: [torch.Tensor], true_center_indices: (int, int)
     
     def update(frame):
         im.set_array(bitmaps[frame])
-        pred_u, pred_e = pred_center_indices_list[frame]
-        
-        pred_hline.set_data([pred_e - 5, pred_e + 5], [pred_u, pred_u])
-        pred_vline.set_data([pred_e, pred_e], [pred_u - 5, pred_u + 5])
-
+        if pred_center_indices_list is None:
+            pred_u, pred_e = pred_center_indices_list[frame]
+            
+            pred_hline.set_data([pred_e - 5, pred_e + 5], [pred_u, pred_u])
+            pred_vline.set_data([pred_e, pred_e], [pred_u - 5, pred_u + 5])
+            return [im]
         return [im, pred_hline, pred_vline]
     
     ani = animation.FuncAnimation(fig, update, frames=len(bitmaps), blit=True)
     plt.tight_layout()
     plt.axis("off")  # Hides both x and y axes
-    ani.save(save_under, writer='pillow', fps=2, dpi=100)
+    ani.save(save_under, writer='pillow', fps=10, dpi=100)
     
     plt.close(fig)
 
