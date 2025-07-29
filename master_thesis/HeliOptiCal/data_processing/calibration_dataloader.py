@@ -350,7 +350,7 @@ class CalibrationDataLoader:
         corrupt_ids = (set(batch_id for ids in helio_and_calib_ids.values() for batch_id in ids
                            if batch_id in set(cal_id for ids in self.corrupt_data_ids.values() for cal_id in ids)))
         if corrupt_ids:
-            info.warning(f'The requested data batch may contain corrupt data: {corrupt_ids}')
+            log.warning(f'The requested data batch may contain corrupt data: {corrupt_ids}')
 
         # Load the whole dataset if None was given
         if len(helio_and_calib_ids) is None:

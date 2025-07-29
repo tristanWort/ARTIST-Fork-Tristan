@@ -18,7 +18,7 @@ import seaborn as sns
 # Add local artist path for raytracing with multiple parallel heliostats.
 repo_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal'))
 sys.path.insert(0, repo_path)
-from HeliOptiCal.utils.util import normalize_images_with_threshold
+from HeliOptiCal.utils.util import normalize_images_with_threshold, normalize_images
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
@@ -361,7 +361,8 @@ class TensorboardLogger:
         else:
             self.writer.add_image(f"{image_name}/{self.mode}/{heliostat_id}", image.cpu().detach(), epoch, dataformats='HW')
     
-    def log_flux_bitmaps(self, epoch: int, bitmaps: torch.Tensor, type: str, helio_and_calib_ids=None, normalize=True):
+    def log_flux_bitmaps(self, epoch: int, bitmaps: torch.Tensor, type: str, helio_and_calib_ids=None, 
+                         normalize=True, threshold=1.0):
         """
         Log a batch of flux bitmaps per heliostat and calibration ID.
 
@@ -386,7 +387,10 @@ class TensorboardLogger:
         norm_bitmaps = torch.zeros_like(bitmaps)
         if normalize:
             for b in range(B):
-                norm_bitmaps[b] = normalize_images_with_threshold(bitmaps[b], threshold=1)
+                if threshold != 0:
+                    norm_bitmaps[b] = normalize_images_with_threshold(bitmaps[b], threshold=threshold)
+                else:
+                    norm_bitmaps[b] = normalize_images(bitmaps[b])
         else:
             norm_bitmaps = bitmaps
 
@@ -396,7 +400,8 @@ class TensorboardLogger:
                 image = norm_bitmaps[b, h_idx]  # shape [H_img, W_img]
                 self.log_image(epoch, image, type, heliostat_id, calib_id=calib_id)
                 
-    def log_diff_flux_bitmaps(self, epoch: int, pred_bitmaps: torch.Tensor, true_bitmaps: torch.Tensor, type: str, helio_and_calib_ids=None, normalize=True):
+    def log_diff_flux_bitmaps(self, epoch: int, pred_bitmaps: torch.Tensor, true_bitmaps: torch.Tensor, type: str, helio_and_calib_ids=None, 
+                              normalize=True, threshold=1.0):
         """
         Log a batch of flux bitmaps per heliostat and calibration ID.
 
@@ -424,8 +429,8 @@ class TensorboardLogger:
         norm_diff_bitmaps = torch.zeros_like(pred_bitmaps)
         if normalize:
             for b in range(B):
-                norm_pred_bitmaps = normalize_images_with_threshold(pred_bitmaps[b], threshold=1)
-                norm_true_bitmaps = normalize_images_with_threshold(true_bitmaps[b], threshold=1)
+                norm_pred_bitmaps = normalize_images_with_threshold(pred_bitmaps[b], threshold=threshold)
+                norm_true_bitmaps = normalize_images_with_threshold(true_bitmaps[b], threshold=threshold)
                 norm_diff_bitmaps[b] = norm_pred_bitmaps - norm_true_bitmaps
         else:
             norm_diff_bitmaps = pred_bitmaps - true_bitmaps
@@ -476,7 +481,7 @@ class TensorboardLogger:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             df_pivot.to_csv(file_path)
             
-        log.info("Saved Metrics to csv-files at location: {self.output_idr}")
+        log.info(f"Saved Metrics to csv-files at location: {output_dir}")
 
     def close(self):
         """Close the SummaryWriter."""
