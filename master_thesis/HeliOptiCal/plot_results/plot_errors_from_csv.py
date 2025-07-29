@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import matplotlib.pyplot as plt
+import seaborn as sns
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 from typing import Optional, List, Tuple
@@ -325,12 +326,15 @@ def plot_combined_error_histogram(df_errors: pd.DataFrame, output_path: str, bin
 
     plt.tight_layout()
     # plt.savefig(output_path, dpi=300)
+
     plt.savefig(output_path, format="pdf")
     plt.close()
     print(f"Saved combined histogram to: {output_path}")
 
 
-def plot_multiple_error_distributions(df_list: List[pd.DataFrame], labels: List[str], output_path: str, meta: str, bin_width: float = 0.1):
+def plot_multiple_error_distributions(df_list: List[pd.DataFrame], labels: List[str], output_path: str, scenario: str, bin_width: float = 0.1, 
+                                      plot_title: bool = True,
+                                      df_list_2: Optional[List[pd.DataFrame]] = None):
     """
     Plot multiple alignment error distributions on a shared histogram.
 
@@ -342,43 +346,145 @@ def plot_multiple_error_distributions(df_list: List[pd.DataFrame], labels: List[
         List of names for each distribution, shown in the legend.
     output_path : str
         Path to save the resulting plot (PDF).
+    senario : str
+        Scenario Name, e.g. 'Base'
     bin_width : float
         Width of histogram bins in mrad.
+    df_list_2 : Optional[List[pd.DataFrame]]
+        Optional second list of dataframes. If given, the plot will show the histograms on a 2x1 grid.
     """
     assert len(df_list) == len(labels), "Number of dataframes must match number of labels."
+    if df_list_2 is not None:
+        assert len(df_list_2) == len(labels), "Number of dataframes must match number of labels."
+    
+    if df_list_2 is None:
+        # Combine to determine consistent bin range
+        all_errors = pd.concat([df['error'].astype(float) for df in df_list])
+        min_val, max_val = all_errors.min(), all_errors.max()
+        bins = int((max_val - min_val) / bin_width) + 1
 
-    # Combine to determine consistent bin range
-    all_errors = pd.concat([df['error'].astype(float) for df in df_list])
-    min_val, max_val = all_errors.min(), all_errors.max()
-    bins = int((max_val - min_val) / bin_width) + 1
+        plt.figure(figsize=(10, 6))
 
-    plt.figure(figsize=(10, 6))
-
-    # Select cmap
-    cmap = cm.get_cmap('tab10')  # 'tab10' is good for categorical colors
-    colors = [mcolors.to_hex(cmap(i % 10)) for i in range(len(df_list))]
+        # Select cmap
+        cmap = cm.get_cmap('tab10')  # 'tab10' is good for categorical colors
+        colors = [mcolors.to_hex(cmap(i % 10)) for i in range(len(df_list))]
+        colors.insert(0, colors.pop())
         
-    for idx, df in enumerate(df_list):
-        errors = df['error'].astype(float)
-        label = labels[idx]
-        color = colors[idx] if colors else None
-        plt.hist(errors, bins=bins, range=(0, max_val), alpha=0.5,
-                 edgecolor='black', label=label, color=color)
+        plt.scatter([], [], label=r'$\text{Alignment-Loss}(\vec{r}_\text{G}, \vec{r}_\text{P})=\text{MSE}(1, \text{COS-SIM}(\vec{r}_\text{G}, \vec{r}_\text{P}))$', 
+                       alpha=0.0)
         
-        # Plot mean line
-        mean_val = errors.mean()
-        plt.axvline(mean_val, color=color, linestyle='--', linewidth=1.5,
-                    label=f"Mean: {mean_val:.2f} mrad")
+        for idx, df in enumerate(df_list):
+            trained_on_ideal = True if idx == 0 else False  
+            errors = df['error'].astype(float)
+            label = labels[idx]
+            color = colors[idx]
+            
+            mean_alpha = 0.6
+            mean_linewidth = 3.5
+            mean_val = errors.mean()
+            label_mean = f"Mean: {mean_val:.2f} mrad"
+            
+            if not trained_on_ideal:
+                mean_linestyle = ['--', '-.', ':', '--', '-.', ':'][idx]
+                plt.hist(errors, bins=bins, range=(0, max_val), alpha=0.5, 
+                         edgecolor='black', label=label, color=color)
+            else:
+                mean_linestyle = '-'
+                mean_alpha = 1.0
+                mean_linewidth = 1.5
+                if 'base' in scenario.lower():
+                    n, bins, patches = plt.hist(errors, bins=bins, range=(0, max_val), alpha=0.5, 
+                                edgecolor='black', label=label, color=color)
+                    for patch in patches:
+                        patch.set_hatch('//')
+                else:
+                    label_mean = label + f" Mean: {mean_val:.2f} mrad"
+                    
+            plt.axvline(mean_val, color=color, linestyle=mean_linestyle, linewidth=mean_linewidth, alpha=mean_alpha, label=label_mean)
+            
+        plt.ylabel('Absolute Frequency', fontsize=11)
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.xlabel(r'$\text{Tracking Error [mrad] := }\theta(\vec{r}_\text{G}, \vec{r}_\text{P})$', fontsize=11)
+        if plot_title:
+            plt.title(f"Tracking Errors over Testing Samples for '{scenario}'-Scenario", fontsize=14)
+        plt.tight_layout()
+        plt.savefig(output_path, format="pdf")
+        plt.close()
+        print(f"Saved multiple-distribution histogram to: {output_path}")
+        
+    else:
+        # Two subplots [2, 1]
+        rows = 2 if df_list_2 is not None else 1
+        size = 10 if df_list_2 is not None else 6
+        fig, axs = plt.subplots(rows, 1, figsize=(10, size), sharex=False)
+        cmap = cm.get_cmap('tab10')
 
-    plt.title(f'Measured Tracking Errors (Testing) in Heliostat Field for [{meta}]')
-    plt.xlabel('Tracking Error [mrad]')
-    plt.ylabel('Absolute Frequency')
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, format="pdf")
-    plt.close()
-    print(f"Saved multiple-distribution histogram to: {output_path}")
+        x_labels = [r'$\text{Tracking Error [mrad] := }\theta(\vec{r}_\text{G}, \vec{r}_\text{P})$']
+        # First subplot
+        if df_list_2 is not None:
+            x_labels.insert(0, r'$\text{Testset Accuracy on COM [mrad] := }\theta(\vec{r}_\text{G,COM}, \vec{r}_\text{P})$')
+            all_errors = pd.concat([df['error'].astype(float) for df_ls in [df_list, df_list_2] for df in df_ls])
+            
+        else:
+            all_errors = pd.concat([df['error'].astype(float) for df in df_list])
+        min_val, max_val = all_errors.min(), all_errors.max()
+        bins = int((max_val - min_val) / bin_width) + 1
+        colors = [mcolors.to_hex(cmap(i % 10)) for i in range(len(df_list))]
+        colors.insert(0, colors.pop())
+        
+        if plot_title:
+            axs[0].set_title(f"Tracking Errors over Testing Samples for '{scenario}'-Scenario", fontsize=14)
+        axs[0].scatter([], [], label=r'$\text{Alignment-Loss}(\vec{r}_\text{G}, \vec{r}_\text{P})=\text{MSE}(1, \text{COS-SIM}(\vec{r}_\text{G}, \vec{r}_\text{P}))$', 
+                       alpha=0.0)
+        
+        max_yaxis = 0
+        for ax, df_ls in enumerate([df_list, df_list_2]):
+            if df_ls is None:
+                continue
+    
+            for idx, df in enumerate(df_ls):
+                trained_on_ideal = True if idx == 0 else False  
+                errors = df['error'].astype(float)
+                label = labels[idx]
+                color = colors[idx]
+                
+                mean_alpha = 0.6
+                mean_linewidth = 3.5
+                mean_val = errors.mean()
+                label_mean = f"Mean: {mean_val:.2f} mrad"
+                
+                if not trained_on_ideal:
+                    mean_linestyle = ['--', '-.', ':', '--', '-.', ':'][idx]
+                    n, bins, patches = axs[ax].hist(errors, bins=bins, range=(0, max_val), alpha=0.5, 
+                            edgecolor='black', label=label, color=color)
+                else:
+                    mean_linestyle = '-'
+                    mean_alpha = 1.0
+                    mean_linewidth = 1.5
+                    if 'base' in scenario.lower():
+                        n, bins, patches = axs[ax].hist(errors, bins=bins, range=(0, max_val), alpha=0.5, 
+                                    edgecolor='black', label=label, color=color)
+                        for patch in patches:
+                            patch.set_hatch('//')
+                    else:
+                        label_mean = label[0] + f" Mean: {mean_val:.2f} mrad"
+                
+                max_yaxis = n.max() if n.max() > max_yaxis else max_yaxis
+                axs[ax].axvline(mean_val, color=color, linestyle=mean_linestyle, linewidth=mean_linewidth, alpha=mean_alpha, label=label_mean)
+            
+            axs[ax].set_ylabel('Absolute Frequency', fontsize=11)
+            axs[ax].legend()
+            axs[ax].grid(True, linestyle="--", alpha=0.5)
+            axs[ax].set_xlabel(x_labels[ax], fontsize=11)
+        
+        for ax in axs:    
+            ax.set_ylim(0, max_yaxis + 10)
+
+        plt.tight_layout()
+        plt.savefig(output_path, format="pdf")
+        plt.close()
+        print(f"Saved dual-distribution histogram to: {output_path}")
 
 
 def plot_grid_of_error_distributions(scenario_grid: List[List[Optional[Tuple[List[pd.DataFrame], str]]]],
@@ -461,7 +567,7 @@ def plot_grid_of_error_distributions(scenario_grid: List[List[Optional[Tuple[Lis
     print(f"Saved grid of error distributions to: {output_path}")
     
 
-def plot_error_boxplots_by_scenario(
+def plot_error_boxplots_by_scenario_old(
     scenario_dfs: List[pd.DataFrame],
     scenario_labels: List[str],
     output_path: str,
@@ -527,6 +633,123 @@ def plot_error_boxplots_by_scenario(
     print(f"Saved boxplot to: {output_path}")
 
 
+def plot_error_boxplots_by_scenario(
+    scenario_dfs: List[pd.DataFrame],
+    scenario_labels: List[str],
+    output_path: str,
+    y_label: str = "Tracking Error [mrad]",
+    plot_title: str = "Tracking Error Distribution by Blocking Scenario",
+    use_violin: bool = False,
+    benchmark = None
+):
+    """
+    Generate a boxplot or violin plot summary of alignment error distributions 
+    for multiple calibration scenarios.
+
+    Parameters
+    ----------
+    scenario_dfs : List[pd.DataFrame]
+        One DataFrame per scenario, each containing a column 'error' with tracking errors in mrad.
+    scenario_labels : List[str]
+        Names of the calibration scenarios shown on the x-axis.
+    output_path : str
+        Path to save the plot as a PDF.
+    y_label : str
+        Label for the y-axis.
+    plot_title : str
+        Title of the plot.
+    use_violin : bool
+        If True, generate violin plots instead of boxplots.
+    """
+    assert len(scenario_dfs) == len(scenario_labels), "Mismatch between scenarios and labels."
+
+    if use_violin:
+        # Combine all data into a single DataFrame
+        combined_df = pd.DataFrame()
+        for df, label in zip(scenario_dfs, scenario_labels):
+            temp_df = df.copy()
+            temp_df["scenario"] = label
+            combined_df = pd.concat([combined_df, temp_df], axis=0)
+
+        combined_df["error"] = combined_df["error"].astype(float)
+        all_max = combined_df["error"].max()
+        
+        fig, ax = plt.subplots(figsize=(12, all_max/2))
+        sns.violinplot(
+            x="scenario",
+            y="error",
+            data=combined_df,
+            ax=ax,
+            palette=["lightblue"],
+            linewidth=1.2,
+            inner=None,
+            cut=0.0
+        )
+
+        ax.text(3, all_max +2.0, plot_title, ha='center', va='bottom', fontsize=15, color='black')
+        
+        if benchmark is not None:
+            ax.axhline(y=benchmark, color='red', linestyle=':', linewidth=1.5, label=rf"$\text{{Benchmark @ }}{benchmark:.2f}$") 
+            
+        # Overlay mean and median
+        for i, label in enumerate(scenario_labels):
+            errors = combined_df[combined_df["scenario"] == label]["error"]
+            mean_val = errors.mean()
+            median_val = errors.median()
+            max_val = errors.max()
+            if label == "60%_on_3rd":
+                min, max = errors.min(), errors.max()
+            ax.plot(i, mean_val, marker='D', color='orange', label='Mean' if i == 0 else "")
+            ax.plot([i - 0.2, i + 0.2], [median_val, median_val], color='black', lw=2, label='Median' if i == 0 else "")
+            
+            # Add text with mean and max
+            ax.text(i, all_max + 0.5, rf"$\mathrm{{mean}}={mean_val:.2f}$" + "\n" + rf"$\mathrm{{max}}={max_val:.2f}$", 
+                    ha='center', va='bottom', fontsize=12, color='black')
+            
+        ax.legend(loc='upper center', fontsize=12)
+
+    else:
+        # Prepare boxplot data
+        data = [df["error"].astype(float).values for df in scenario_dfs]
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        ax.boxplot(
+            data,
+            vert=True,
+            patch_artist=True,
+            tick_labels=scenario_labels,
+            showmeans=True,
+            showfliers=False,
+            whis=[0, 100],
+            flierprops=dict(marker='o', color='red', markersize=4, alpha=0.6),
+            boxprops=dict(facecolor="lightblue", color="blue"),
+            capprops=dict(color="blue"),
+            whiskerprops=dict(color="blue"),
+            medianprops=dict(color="black"),
+            meanprops=dict(marker='D', markeredgecolor='black', markerfacecolor='orange')
+        )
+
+        # Custom legend
+        ax.plot([], [], color='black', label='Median')
+        ax.plot([], [], marker='D', color='orange', linestyle='None', label='Mean')
+        ax.plot([], [], color='blue', linestyle='-', label='Range (Min/Max)')
+        ax.plot([], [], marker='s', color='lightblue', linestyle='None', label='Interquartile Range')
+        ax.legend(loc='upper center', fontsize=12)
+
+    # Shared styling
+    ax.set_xlabel('', fontsize=1)
+    ax.set_ylabel(y_label, fontsize=12)
+    # if plot_title is not None:
+    #     ax.set_title(plot_title, fontsize=14)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.tick_params(axis='x', labelsize=12)
+    ax.tick_params(axis='y', labelsize=12)
+
+    plt.tight_layout()
+    plt.savefig(output_path, format="pdf")
+    plt.close()
+    print(f"Saved {'violin' if use_violin else 'box'} plot to: {output_path}")
+
 
 if __name__ == '__main__':
     
@@ -574,9 +797,10 @@ if __name__ == '__main__':
     """
     Use multiple erorr distributions for comparison across runs.
     """     
-                        # Geometric        Geometric w/ COM     Contour
-    all_result_runs = [['run_2506301701', 'run_2506301703', 'run_2506301357'],  # Base
-                       ['run_2507011659', 'run_2507011050', 'run_2506301935'], # 20%_4th
+                        # Geometric        Geometric w/ COM     Contour         
+    all_result_runs = [['run_2507101421', 'run_2507101427', 'run_2506301357'],  # Base
+                       ['run_2507111022', 'run_2507101255', 'run_2507101348'],  # Realistic
+                       ['run_2507011659', 'run_2507011050', 'run_2507141711'], # 20%_4th
                        ['run_2507011657', 'run_2507011049', 'run_2506301937'], # 20%_3rd
                        ['run_2507021056', 'run_2507011055', 'run_2506301939'], # 40%_4th
                        ['run_2507021047', 'run_2507011057', 'run_2507011154'], # 40%_3rd
@@ -584,32 +808,57 @@ if __name__ == '__main__':
                        ['run_2507021045', 'run_2507011045', 'run_2506301944'], # 60%_3rd
     ]
     final_ouptut_dir = '/dss/dsshome1/05/di38kid/data/results/plots/final_result_plots'
-    names = all_result_runs[6]
-    meta='60_on_3rd'
+    import copy
+    names = copy.deepcopy(all_result_runs[0])
+    labels = []
+    scenario='Base'
+    names.insert(0, 'run_2507101431')  # Geo w/ ideal for 'Base' Dataset
+    labels.append(r'$\text{Alignment-Loss}(\vec{r}_\text{G}, {\vec{r}_\text{P}})$')
     
-    error_dataframes = []
-    for name in names:
+    actual_error_dataframes = []
+    approx_error_dataframes = []
+    for i, name in enumerate(names):
         run = f'/dss/dsshome1/05/di38kid/data/results/runs/{name}_20_Heliostats'
-        df_actual_errors = load_alignment_errors(f"{run}/logs/AlignmentErrors_mrad.csv", idx=-1)
-        error_dataframes.append(df_actual_errors[df_actual_errors["mode"] == mode])
+        idx=-1
+        if i == 3:
+            idx=-2
+        df_actual_errors = load_alignment_errors(f"{run}/logs/ActualAlignmentErrors_mrad.csv", idx=idx)
+        actual_error_dataframes.append(df_actual_errors[df_actual_errors["mode"] == mode])
+        df_errors = load_alignment_errors(f"{run}/logs/AlignmentErrors_mrad.csv", idx=idx)
+        approx_error_dataframes.append(df_errors[df_errors["mode"] == mode])
     
-    labels = ['Conventional Geometric', 'Conventional Geometric w/ COM', 'Image-Based / Contour']
+    # labels = ['Conventional Geometric', 'Conventional Geometric w/ COM', 'Image-Based / Contour', # 'Geometric w/ ideal RA'
+    #           ]
+    
+    alignment_loss = r'$\text{Alignment-Loss}=\text{MSE}(1, \text{COS-SIM}(\vec{r}_\text{G}, {\vec{r}_{\text{P}}}))$'
+    labels.append(r'$\text{Alignment-Loss}(\vec{r}_\text{G,COM}, {\vec{r}_{\text{P}}})$')
+    labels.append(r'$\text{Alignment-Loss}(\vec{r}_{\text{G,COM}}, {\vec{r}_{\text{P,COM}}})$')
+    labels.append(r'$\text{Contour-Loss}(I_{\text{G}}, I_{\text{P}})$')
+    
     final_hist_dir = f'{final_ouptut_dir}/histograms_meta'
     os.makedirs(final_hist_dir, exist_ok=True)
-    plot_multiple_error_distributions(error_dataframes, labels, f'{final_hist_dir}/250702_{meta}_with_mean_ni.pdf', meta=meta)
+    plot_multiple_error_distributions(approx_error_dataframes, labels, f'{final_hist_dir}/250711_{scenario}_with_mean.pdf', scenario=scenario, plot_title=False,
+                                      df_list_2=actual_error_dataframes
+                                      )
+    
+    sys.exit()
     
     error_dataframes = []
     for i, scenario in enumerate(all_result_runs):
-        run = f'/dss/dsshome1/05/di38kid/data/results/runs/{scenario[0]}_20_Heliostats'
+        run = f'/dss/dsshome1/05/di38kid/data/results/runs/{scenario[1]}_20_Heliostats'
         idx = -1
         if i == 0:
-            idx = -2
-        # df_actual_errors = load_alignment_errors(f"{run}/logs/ActualAlignmentErrors_mrad.csv", idx=idx)
-        # error_dataframes.append(df_actual_errors[df_actual_errors["mode"] == mode])
+            idx = -1
+        if i == 1:
+            continue # do not include realistic scenario
+        df_actual_errors = load_alignment_errors(f"{run}/logs/ActualAlignmentErrors_mrad.csv", idx=idx)
+        error_dataframes.append(df_actual_errors[df_actual_errors["mode"] == mode])
     
-    meta='geo_COM'
-    # plot_error_boxplots_by_scenario(error_dataframes, ['Base', '20%_on_4th', '20%_on_3rd', '40%_on_4th', '40%_on_3rd', '60%_on_4th', '60%_on_3rd'], f'{final_hist_dir}/250702_{meta}_boxplots.pdf')
+    meta='geo_com'
+    plot_error_boxplots_by_scenario(error_dataframes, ['Base', '20%_on_4th', '20%_on_3rd', '40%_on_4th', '40%_on_3rd', '60%_on_4th', '60%_on_3rd'], 
+                                    f'{final_hist_dir}/250717_{meta}_violinplot.pdf', use_violin=True, plot_title=labels[2], benchmark=0.34)
     
+    sys.exit() 
     
     """
     Show gird of erorr distributions for comparison over all scenarios across runs.
@@ -627,4 +876,3 @@ if __name__ == '__main__':
                       [(all_error_dfs[4], '20_on_3rd'), (all_error_dfs[5], '40_on_3rd'),    (all_error_dfs[6], '60_on_3rd'),],]
     
     # plot_grid_of_error_distributions(grid_error_dfs, labels, f'{final_hist_dir}/meta_with_mean.pdf')
-    

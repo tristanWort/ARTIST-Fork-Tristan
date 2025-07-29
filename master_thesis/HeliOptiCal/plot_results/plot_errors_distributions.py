@@ -1,9 +1,10 @@
 import os
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
-from typing import Literal
+from typing import Literal, List, Dict
 from matplotlib.cm import ScalarMappable
 from scipy.interpolate import griddata
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -65,7 +66,417 @@ def merge_data(alignment_errors_df, sun_positions_df):
     
     return merged_df
 
+
 def plot_alignment_errors_over_sun_pos(merged_data, 
+                                       output_dir,
+                                       error_label='Tracking Error',
+                                       sep_plots: bool=True,
+                                       print_mean_error: bool=True,
+                                       marker_for_training='*'):
+    """
+    Generate plots of tracking errors over sun position for each heliostat.
+    Also, generates a plot displaying all errors for all heliostats.
+    
+    Args:
+        merged_data: DataFrame with merged alignment errors and sun positions
+        output_dir: Directory to save plots
+        sep_plots: If True, then errors for will be shown per heliostat.
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get unique heliostat IDs
+    heliostat_ids = merged_data['heliostat_id'].unique()
+    max_error = merged_data["error"].max()
+    
+    markers = {'Training': marker_for_training, 'Validation': 'o', 'Testing': 'o'}
+    cmap = {'Training': 'black', 'Validation': 'blue', 'Testing': 'red'}
+    if marker_for_training == 'o':  # will display training error as scaled ring
+        cmap['Training'] = 'green'
+    marker_scaling = 10.0  # marker_size = marker_scaling * error
+    
+    # Helper function to plot one figure
+    def plot_for_data(data, heliostat_label, filename):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        modes = data['mode'].unique()
+        for mode in modes:
+            mode_data = data[data['mode'] == mode]
+            if mode_data.empty:
+                continue
+
+            # Plot data points
+            for _, row in mode_data.iterrows():
+                if mode == 'train' and marker_for_training == '*':
+                    ax.plot(row['azimuth'], row['elevation'],
+                            color=cmap[mode],
+                            marker=markers[mode],
+                            markersize=0.5)
+                    continue
+
+                ring_radius = 1.0
+                while ring_radius <= (row['error'] + 1.0):
+                    ax.plot(row['azimuth'], row['elevation'],
+                            markersize=ring_radius * marker_scaling,
+                            color='grey', fillstyle='none', marker='o', alpha=0.4)
+                    ring_radius += 1.0
+
+                ax.plot(row['azimuth'], row['elevation'],
+                        color=cmap[mode],
+                        marker=markers[mode],
+                        markersize=row['error'] * marker_scaling,
+                        alpha=0.4)
+
+            # Compute mean error and add to legend
+            label = mode
+            if print_mean_error:
+                mean_error = mode_data['error'].mean()
+                label = f"{mode} [{round(mean_error, 2)} mrad]"
+            ax.scatter([], [], s=1.0 * marker_scaling, marker=markers[mode],
+                      facecolors='none', edgecolors=cmap[mode], label=label)
+        
+        ax.legend(loc='lower right', fontsize=11)
+        az_max = data["azimuth"].max()
+        ax.plot(77, 9, color='grey', fillstyle='none', marker='o', markersize=1 * marker_scaling, alpha=0.4)
+        ax.text(80, 8.5, '= 1 mrad', fontsize=11)
+
+        ax.set_xlabel('Sun Azimuth [°]')
+        ax.set_ylabel('Sun Elevation [°]')
+        ax.set_title(f"{error_label} for {heliostat_label}")
+        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.set_ylim(0)
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, filename), format="pdf")
+        plt.close(fig)
+            
+    # Plot per heliostat
+    if sep_plots:
+        for heliostat_id in heliostat_ids:
+            heliostat_data = merged_data[merged_data['heliostat_id'] == heliostat_id]
+            plot_for_data(heliostat_data, f"Heliostat {heliostat_id}", f"{heliostat_id}_alignment_errors.pdf")
+            print(f"Plot for heliostat {heliostat_id} saved to {output_dir}")
+
+    # Combined plot for all heliostats
+    plot_for_data(merged_data, "Scenario '20%_on_3rd'", "all_heliostats_alignment_errors.pdf")
+    print(f"Combined plot for all heliostats saved to {output_dir}")
+
+
+def plot_errors_over_heliostats_by_distance(
+    merged_data: pd.DataFrame,
+    heliostat_distances: Dict[str, float],
+    output_path: str,
+    title = None,
+    print_mean_error: bool = True,
+    marker_for_training: str = '*',
+):
+    """
+    Plot errors as marker sizes over heliostat IDs (sorted by distance), with sun azimuth on the y-axis.
+
+    Parameters
+    ----------
+    merged_data : pd.DataFrame
+        DataFrame with columns: ['heliostat_id', 'azimuth', 'error', 'mode']
+    heliostat_distances : Dict[str, float]
+        Mapping from heliostat_id to distance from power plant [m]
+    output_path : str
+        Path to save the plot as a PDF
+    error_label : str
+        Label for the plot title
+    print_mean_error : bool
+        Whether to print mean error in the legend
+    marker_for_training : str
+        Marker for training samples
+    """
+    # Validate input
+    assert 'heliostat_id' in merged_data.columns
+    assert 'azimuth' in merged_data.columns
+    assert 'error' in merged_data.columns
+    assert 'mode' in merged_data.columns
+
+    # Filter out heliostats not in distance dict
+    merged_data = merged_data[merged_data['heliostat_id'].isin(heliostat_distances.keys())]
+
+    # Create x-ticks: Heliostat ID (distance)
+    unique_ids = sorted(set(merged_data['heliostat_id']), key=lambda h: heliostat_distances[h])
+    xtick_labels = [f"{hid} ({heliostat_distances[hid]:.1f} m)" for hid in unique_ids]
+    id_to_xtick = {hid: idx for idx, hid in enumerate(unique_ids)}
+
+    markers = {'Training': marker_for_training, 'Validation': 'o', 'Testing': 'o'}
+    cmap = {'Training': 'black', 'Validation': 'blue', 'Testing': 'red'}
+    if marker_for_training == 'o':
+        cmap['Training'] = 'green'
+    marker_scaling = 10.0
+
+    # Start plotting
+    fig, ax = plt.subplots(figsize=(max(12, len(unique_ids) * 0.6), 14))
+    modes = merged_data['mode'].unique()
+
+    # Add reference marker
+    ax.scatter([], [], s=(marker_scaling)**2, marker='o', color='grey', facecolors='none', label='= 1.0 mrad')
+    
+    for mode in modes:
+        mode_data = merged_data[merged_data['mode'] == mode]
+        if mode_data.empty:
+            continue
+
+        for _, row in mode_data.iterrows():
+            x_pos = id_to_xtick[row['heliostat_id']]
+            y_pos = row['elevation']
+            error = row['error']
+            if mode == 'Training' and marker_for_training == '*':
+                ax.plot(x_pos, y_pos, marker='*', color=cmap[mode], markersize=4)
+            else:
+                ring_radius = 1.0
+                while ring_radius <= (error + 1.0):
+                    ax.plot(x_pos, y_pos,
+                            markersize=ring_radius * marker_scaling,
+                            color='grey', fillstyle='none', marker='o', alpha=0.4)
+                    ring_radius += 1.0
+
+                ax.plot(x_pos, y_pos,
+                        marker=markers[mode],
+                        color=cmap[mode],
+                        markersize=error * marker_scaling,
+                        alpha=0.4)
+
+        # Legend: dummy marker with mean error
+        label = mode
+        if print_mean_error:
+            mean_error = mode_data['error'].mean()
+            label = f"{mode} [{mean_error:.2f} mrad]"
+        ax.scatter([], [], s=(marker_scaling)**2, marker=markers[mode], color=cmap[mode], label=label, alpha=0.4)
+    
+    # ax.plot(15.3, merged_data['elevation'].max() +6, color='grey', fillstyle='none',
+    #         marker='o', markersize=1 * marker_scaling)
+    # ax.text(15.5, merged_data['elevation'].max() +5.5, '= 1 mrad', fontsize=10)
+
+    # Axis labels
+    ax.set_xlabel("Heliostat ID (Distance from Power Plant)", fontsize=24, labelpad=8)
+    ax.set_ylabel("Sun Elevation [°]", fontsize=24)
+    if title is not None:
+        ax.set_title(f"{title}", fontsize=20)
+    ax.set_xticks(range(len(xtick_labels)))
+    ax.set_xticklabels(xtick_labels, rotation=55, ha='right', fontsize=20)
+    ax.set_ylim(-2, merged_data['elevation'].max()+2)
+                # merged_data['elevation'].max() + 15)
+    ax.tick_params(axis='y', labelsize=24)
+    ax.legend(loc='lower center', fontsize=20, ncol=len(ax.get_legend_handles_labels()[0]))
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+    # Save
+    plt.tight_layout()
+    fig.savefig(output_path, format="pdf")
+    plt.close()
+    print(f"Saved error overview plot to: {output_path}")
+
+
+def plot_error_kde_bands_over_heliostats_by_distance(
+    merged_data: pd.DataFrame,
+    heliostat_distances: Dict[str, float],
+    output_path: str,
+    title=None,
+    print_mean_error: bool = True,
+    marker_for_training: str = '*',
+    bandwidth: float = 1.0,
+    elevation_res: int = 200
+):
+    """
+    Plot errors as KDE-filled vertical bands per heliostat and mode, using error magnitude as horizontal width.
+
+    Parameters
+    ----------
+    merged_data : pd.DataFrame
+        Columns: ['heliostat_id', 'elevation', 'error', 'mode']
+    heliostat_distances : Dict[str, float]
+        Maps heliostat_id -> distance in [m]
+    output_path : str
+        Where to save the output figure (PDF)
+    title : str, optional
+        Title for the figure
+    print_mean_error : bool
+        Whether to include mean error in legend
+    marker_for_training : str
+        For legend consistency, not used in plot
+    bandwidth : float
+        Bandwidth used for KDE smoothing
+    elevation_res : int
+        Number of vertical points to sample for KDE line
+    """
+    from scipy.stats import gaussian_kde
+    
+    assert {'heliostat_id', 'elevation', 'error', 'mode'}.issubset(merged_data.columns)
+
+    # Filter valid heliostats
+    merged_data = merged_data[merged_data['heliostat_id'].isin(heliostat_distances.keys())]
+
+    # Order heliostats by distance
+    unique_ids = sorted(set(merged_data['heliostat_id']), key=lambda h: heliostat_distances[h])
+    xtick_labels = [f"{hid} ({heliostat_distances[hid]:.1f} m)" for hid in unique_ids]
+    id_to_xtick = {hid: idx for idx, hid in enumerate(unique_ids)}
+
+    # Color per mode
+    modes = ['Training', 'Validation', 'Testing']
+    colors = {'Training': 'black', 'Validation': 'blue', 'Testing': 'red'}
+
+    fig, ax = plt.subplots(figsize=(max(12, len(unique_ids) * 0.6), 8))
+
+    elevation_min = merged_data['elevation'].min() - 5
+    elevation_max = merged_data['elevation'].max() + 15
+    elevation_grid = np.linspace(elevation_min, elevation_max, elevation_res)
+
+    # Determine global max error for consistent scaling
+    global_max_error = merged_data['error'].max()
+    width_scale = 0.4  # max width in "x-axis units" per 1.0 mrad
+
+    for mode in modes:
+        mode_data = merged_data[merged_data['mode'] == mode]
+        if mode_data.empty:
+            continue
+
+        for heliostat_id in unique_ids:
+            data = mode_data[mode_data['heliostat_id'] == heliostat_id]
+            if data.empty:
+                continue
+
+            x_center = id_to_xtick[heliostat_id]
+            elevations = data['elevation'].values
+            errors = data['error'].values
+
+            # KDE approximation of error as a function of elevation
+            try:
+                kde = gaussian_kde(elevations, weights=errors, bw_method=bandwidth / np.std(elevations))
+                error_profile = kde(elevation_grid)
+            except Exception:
+                continue  # fallback if KDE fails due to few points
+
+            # Normalize error profile using global max error
+            widths = (error_profile / global_max_error) * width_scale
+
+            ax.fill_betweenx(
+                y=elevation_grid,
+                x1=x_center - widths,
+                x2=x_center + widths,
+                color=colors[mode],
+                alpha=0.3,
+                linewidth=0
+            )
+
+        # Add dummy for legend
+        label = mode
+        if print_mean_error:
+            mean_error = mode_data['error'].mean()
+            label = f"{mode} [{mean_error:.2f} mrad]"
+        ax.plot([], [], color=colors[mode], alpha=0.5, linewidth=10, label=label)
+
+    # Legend: width = 1 mrad reference band
+    ax.fill_betweenx(
+        y=[elevation_min + 2, elevation_min + 10],
+        x1=[-width_scale] * 2,
+        x2=[+width_scale] * 2,
+        color='gray',
+        alpha=0.3,
+        label='= 1.0 mrad'
+    )
+
+    # Labels and layout
+    ax.set_xlabel("Heliostat ID (Distance from Power Plant)", fontsize=20, labelpad=8)
+    ax.set_ylabel("Sun Elevation [°]", fontsize=20)
+    if title:
+        ax.set_title(title, fontsize=20)
+    ax.set_xticks(range(len(xtick_labels)))
+    ax.set_xticklabels(xtick_labels, rotation=45, ha='right', fontsize=18)
+    ax.tick_params(axis='y', labelsize=18)
+    ax.set_ylim(elevation_min, elevation_max)
+    ax.legend(loc='upper center', fontsize=18, ncol=len(ax.get_legend_handles_labels()[0]))
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    fig.savefig(output_path, format='pdf')
+    plt.close()
+    print(f"Saved normalized KDE band plot to: {output_path}")
+
+
+def plot_error_violinplots_by_scenario(scenario_dfs: List[pd.DataFrame], scenario_labels: List[str], output_dir: str, 
+                                       y_label: str = "Tracking Error [mrad]", plot_title: str = "Tracking Error Distribution by Scenario"):
+    """
+    Generate a violin plot of alignment error distributions for multiple calibration scenarios.
+
+    Parameters
+    ----------
+    scenario_dfs : List[pd.DataFrame]
+        One DataFrame per scenario, each containing a column 'error' with tracking errors in mrad.
+    scenario_labels : List[str]
+        Names of the calibration scenarios shown on the x-axis.
+    output_path : str
+        Path to save the plot as a PDF.
+    y_label : str
+        Label for the y-axis.
+    plot_title : str
+        Title of the plot.
+    """
+    assert len(scenario_dfs) == len(scenario_labels), "Mismatch between dataframes and labels."
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a combined DataFrame for plotting
+    combined_df = pd.DataFrame()
+    for df, label in zip(scenario_dfs, scenario_labels):
+        temp_df = df.copy()
+        temp_df["scenario"] = label
+        combined_df = pd.concat([combined_df, temp_df], axis=0)
+
+    # Ensure proper types
+    combined_df["error"] = combined_df["error"].astype(float)
+    combined_df["scenario"] = combined_df["scenario"].astype(str)
+
+    # Plotting
+    fig, ax = plt.subplots(figsize=(12, 5))
+    sns.violinplot(
+        x="scenario",
+        y="error",
+        data=combined_df,
+        palette=['lightblue'],
+        ax=ax,
+        inner=None,          # Disable default inner representation
+        linewidth=1.2,
+        cut=0
+    )
+
+    # Overlay mean and median
+    for i, scenario in enumerate(scenario_labels):
+        errors = combined_df[combined_df["scenario"] == scenario]["error"]
+        mean_error = errors.mean()
+        median_error = errors.median()
+        max_error = errors.max()
+
+        # Plot mean as diamond
+        ax.plot(i, mean_error, marker='D', color='orange', markersize=7, label='Mean' if i == 0 else "")
+        # Plot median as horizontal black line
+        ax.plot([i - 0.2, i + 0.2], [median_error, median_error], color='black', lw=2, label='Median' if i == 0 else "")
+
+        # Add text with mean and max at y = 10 mrad
+        ax.text(i, max_error +1.5, rf"$\mathrm{{mean}}={mean_error:.2f}$" + "\n" + rf"$\mathrm{{max}}={max_error:.2f}$", 
+                ha='center', va='bottom', fontsize=12, color='black')
+        
+    # Styling
+    ax.set_xlabel('', fontsize=0)
+    ax.set_ylabel(y_label, fontsize=12)
+    if plot_title is not None:
+        ax.set_title(plot_title, fontsize=14)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.set_xticklabels(scenario_labels, fontsize=12)
+    ax.tick_params(axis='y', labelsize=12)
+
+    # Add legend once
+    ax.legend(loc='upper center', fontsize=12)
+
+    # Save
+    plt.tight_layout()
+    filename = "all_reflection_axis_violinplot.pdf"
+    fig.savefig(os.path.join(output_dir, filename), format="pdf")
+    plt.close(fig)
+    print(f"Saved violin plot to: {output_dir}")
+
+
+def plot_alignment_errors_over_sun_pos_old(merged_data, 
                           output_dir, 
                           average_errors=None,
                           type=Literal['show_size', 'show_color_gradient'], 
@@ -101,15 +512,15 @@ def plot_alignment_errors_over_sun_pos(merged_data,
         max_error = heliostat_data['error'].max()
         
         if type == 'show_color_gradient':
-            markers = {'Train': 'o', 'Valid': 's', 'Test': '^'}
+            markers = {'Training': 'o', 'Validation': 's', 'Testing': '^'}
             # Calculate global min/max for colormap normalization
             # Define markers for different mode
             norm = colors.Normalize(vmin=min_error, vmax=max_error)
             cmap = plt.cm.viridis
         
         elif type == 'show_size':
-            markers = {'Train': '*', 'Valid': 'o', 'Test': 'o'}
-            cmap = {'Train': 'black', 'Valid': 'blue', 'Test': 'red'}
+            markers = {'Training': '*', 'Validation': 'o', 'Testing': 'o'}
+            cmap = {'Training': 'black', 'Validation': 'blue', 'Testing': 'red'}
             marker_scaling = 20
         
         # For scatter plots or interpolation points
@@ -122,15 +533,15 @@ def plot_alignment_errors_over_sun_pos(merged_data,
                 if type=='show_size':                
                     for i, data in mode_data.iterrows():  
                                
-                        if mode == 'Train':
-                            # Plot black star for training samples
-                            ax.plot(data['azimuth'],
-                                    data['elevation'],
-                                    color=cmap[mode],
-                                    marker=markers[mode],
-                                    markersize=10,
-                                    )  
-                            continue  # Skip the rest for Train mode
+                        # if mode == 'train':
+                        #     # Plot black star for training samples
+                        #     ax.plot(data['azimuth'],
+                        #             data['elevation'],
+                        #             color=cmap[mode],
+                        #             marker=markers[mode],
+                        #             markersize=10,
+                        #             )  
+                        #     continue  # Skip the rest for Train mode
                                     
                         # Plot empty circles around data points
                         plot_error = 1.0
