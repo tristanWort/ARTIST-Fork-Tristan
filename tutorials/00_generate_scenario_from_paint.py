@@ -27,6 +27,7 @@ print(device)
 
 # Specify the path to your scenario file.
 scenario_folder = pathlib.Path('/dss/dsshome1/05/di38kid/data/scenarios')
+# scneario_name = 
 
 # Specify the path to your tower-measurements.json file.
 tower_file = pathlib.Path(

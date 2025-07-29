@@ -65,7 +65,7 @@ if use_raytracing:
     learning_rate_patience = 18
     learning_rate_threshold = 0.1
 
-optimizer = torch.optim.Adam(parameters, lr=initial_learning_rate)
+
 
 # Set up learning rate scheduler
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
