@@ -204,7 +204,6 @@ class CalibrationModel(nn.Module):
                     optimizer=self.optimizer,
                     factor=config['lr_factor'],
                     patience=config['lr_patience'],
-                    factor=0.5,
                 )
             elif scheduler == 'CyclicLR':
                 scheduler = torch.optim.lr_scheduler.CyclicLR(

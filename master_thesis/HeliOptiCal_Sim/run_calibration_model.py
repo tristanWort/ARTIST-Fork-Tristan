@@ -14,9 +14,9 @@ from artist.util.scenario import Scenario
 from calibration_model import CalibrationModel
 
 # Add local path to modify scenario and include random errors to parameters
-sim_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/simulate_data'))
+sim_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal'))
 sys.path.insert(0, sim_path) 
-from simulate_data.add_random_errors import add_random_errors_to_kinematic
+from HeliOptiCal.utils.util_errors import add_random_errors_to_kinematic
 
 if __name__ == '__main__':
     """
@@ -45,21 +45,32 @@ if __name__ == '__main__':
             scenario_file=scenario_file, 
             device=device
         )
+    
     heliostat_ids = loaded_scenario.heliostat_field.all_heliostat_names
+    run_config['run']['heliostats'] = loaded_scenario.heliostat_field.all_heliostat_names
     
     # Define name of run which will be model name.
     run = str('run_' + datetime.now().strftime("%y%m%d%H%M") + '_' 
               + '.'.join([heliostat_id for heliostat_id in heliostat_ids]))
 
     # Returns a copy of the kinematic instance with changed paramaters
-    modified_kinematic = add_random_errors_to_kinematic(kinematic=loaded_scenario.heliostat_field.rigid_body_kinematic, 
-                                                        save_dir=Path(f'/dss/dsshome1/05/di38kid/data/results/runs/{run}') / 'parameters', 
-                                                        heliostat_names=heliostat_ids,
-                                                        seed=7, 
-                                                        device=device)
+    # modified_kinematic = add_random_errors_to_kinematic(error_config=run_config['error_config'],
+    #                                                     kinematic=loaded_scenario.heliostat_field.rigid_body_kinematic, 
+    #                                                     save_dir=Path(f'/dss/dsshome1/05/di38kid/data/results/runs/{run}') / 'parameters', 
+    #                                                     heliostat_names=heliostat_ids,
+    #                                                     seed=run_config['run']['random_seed'], 
+    #                                                     device=device)
 
     # Replace the 'old' kinematic with the modified kinematic
-    loaded_scenario.heliostat_field.rigid_body_kinematic = modified_kinematic
+    # loaded_scenario.heliostat_field.rigid_body_kinematic = modified_kinematic
+        
+    import copy
+    scenario_copy = copy.deepcopy(loaded_scenario)
+    
+    # Save config in the folder
+    folder_path = Path(f'/dss/dsshome1/05/di38kid/data/results/runs/{run}')
+    os.makedirs(folder_path, exist_ok=True)
+    json.dump(run_config, open(folder_path / 'run_config.json', 'w+'), indent=4)
     
     # Initiate Calibration Model.
     model = CalibrationModel(
@@ -73,16 +84,29 @@ if __name__ == '__main__':
         )
     
     splits = model.calibration_data_loader.splits
+    
     for split_type in splits.keys():
         for split_sizes in splits[split_type].keys():
+            
             print(f"{split_type}: {split_sizes}")
-            model.calibrate(num_epochs=run_config['run']['num_epochs'], 
-                            log_steps=1, 
+            split_df = splits[split_type][split_sizes]
+            
+            heliostat_and_calib_dict = {
+                heliostat_id: split_df.loc[split_df['HeliostatId'] == heliostat_id].index.tolist()
+                for heliostat_id in run_config['run']['heliostats']
+            }
+            # model.find_max_lr(heliostat_and_calib_dict, restore_scenario=scenario_copy, freeze_parameters=run_config['freeze_parameters'])
+            
+            model.calibrate(num_epochs=run_config['model']['num_epochs'], 
+                            log_steps=run_config['run']['log_steps'], 
+                            heliostat_names=run_config['run']['heliostats'],
                             split_type=split_type,
-                            split_sizes=split_sizes, 
+                            split_sizes=split_sizes,
+                            freeze_parameters=run_config['freeze_parameters'],
+                            phase_parameter_learning=run_config['model']['phase_parameter_learning'],
                             seed=run_config['run']['random_seed'],
-                            use_raytracing=bool(run_config['run']['use_raytracing']), 
                             run_config=run_config, device=device)
+
         
     # model.cuda()
 

@@ -51,6 +51,17 @@ class TensorboardLogger:
         self.mode = "Train"  # Default mode
         log.info(f"TensorboardLogger initialized: {name} - Logs will be saved to {log_dir}")
     
+    def set_mode(self, mode: str):
+        """
+        Set current mode.
+        
+        Parameters
+        ----------
+        mode : str
+            Mode of logging, eg. "Train", "Validation", "Test"
+        """
+        self.mode = mode
+    
     def log_loss(self, loss_name: str, value: float, epoch: int):
         """
         Log a loss value.

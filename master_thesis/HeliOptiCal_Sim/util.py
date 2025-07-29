@@ -1,7 +1,17 @@
+import os
+import sys
 import torch
 import gpustat
 import psutil
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+
+# Add local artist path for raytracing with multiple parallel heliostats.
+repo_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/artist'))
+sys.path.insert(0, repo_path) 
 from artist.field.kinematic_rigid_body import RigidBody
+
+from logger import TensorboardReader
 
 # TODO: Add names keys for parameters dict
 def get_rigid_body_kinematic_parameters_from_scenario(
@@ -160,60 +170,49 @@ def create_parameter_groups(all_heliostats_params, num_heliostats):
     
     return param_groups
 
-# def get_rigid_body_kinematic_parameters_from_scenario(
-#     kinematic: RigidBody,
-# ) -> dict[str, torch.Tensor]:
-#     """
-#     Extract all deviation parameters and actuator parameters from a rigid body kinematic.
-
-#     Parameters
-#     ----------
-#     kinematic : RigidBody
-#         The kinematic from which to extract the parameters.
-
-#     Returns
-#     -------
-#     dict[str, torch.Tensor]
-#         The parameters from the kinematic (requires_grad is True).
-#     """
-
-#     parameters_dict = {
-#         "heliostat_position_enu_4d": kinematic.position,
-#         "first_joint_translation_e": kinematic.deviation_parameters.first_joint_translation_e,
-#         "first_joint_translation_n": kinematic.deviation_parameters.first_joint_translation_n,
-#         "first_joint_translation_u": kinematic.deviation_parameters.first_joint_translation_u,
-#         "first_joint_tilt_e": kinematic.deviation_parameters.first_joint_tilt_e,
-#         "first_joint_tilt_n": kinematic.deviation_parameters.first_joint_tilt_n,
-#         "first_joint_tilt_u": kinematic.deviation_parameters.first_joint_tilt_u,
-#         "second_joint_translation_e": kinematic.deviation_parameters.second_joint_translation_e,
-#         "second_joint_translation_n": kinematic.deviation_parameters.second_joint_translation_n,
-#         "second_joint_translation_u": kinematic.deviation_parameters.second_joint_translation_u,
-#         "second_joint_tilt_e": kinematic.deviation_parameters.second_joint_tilt_e,
-#         "second_joint_tilt_n": kinematic.deviation_parameters.second_joint_tilt_n,
-#         "second_joint_tilt_u": kinematic.deviation_parameters.second_joint_tilt_u,
-#         "concentrator_translation_e": kinematic.deviation_parameters.concentrator_translation_e,
-#         "concentrator_translation_n": kinematic.deviation_parameters.concentrator_translation_n,
-#         "concentrator_translation_u": kinematic.deviation_parameters.concentrator_translation_u,
-#         "concentrator_tilt_e": kinematic.deviation_parameters.concentrator_tilt_e,
-#         "concentrator_tilt_n": kinematic.deviation_parameters.concentrator_tilt_n,
-#         "concentrator_tilt_u": kinematic.deviation_parameters.concentrator_tilt_u,
-#         "actuator1_increment": kinematic.actuators.actuator_list[0].increment,
-#         "actuator1_initial_stroke_length": kinematic.actuators.actuator_list[0].initial_stroke_length,
-#         "actuator1_offset": kinematic.actuators.actuator_list[0].offset,
-#         "actuator1_pivot_radius": kinematic.actuators.actuator_list[0].pivot_radius,
-#         "actuator1_initial_angle": kinematic.actuators.actuator_list[0].initial_angle,
-#         "actuator2_increment": kinematic.actuators.actuator_list[1].increment,
-#         "actuator2_initial_stroke_length": kinematic.actuators.actuator_list[1].initial_stroke_length,
-#         "actuator2_offset": kinematic.actuators.actuator_list[1].offset,
-#         "actuator2_pivot_radius": kinematic.actuators.actuator_list[1].pivot_radius,
-#         "actuator2_initial_angle": kinematic.actuators.actuator_list[1].initial_angle,
-#     }
-
-    for parameter in parameters_dict.values():
-        if parameter is not None:
-            parameter.requires_grad_()
-
-    return parameters_dict
+def calculate_intersection(ray_origin: torch.Tensor, 
+                           ray_direction: torch.Tensor, 
+                           plane_center: torch.Tensor, 
+                           plane_normal: torch.Tensor):
+    """
+    Calculate the intersection point of a batch of rays with a plane.
+    
+    All inputs must be given in ENU-coordinates. 
+    
+    Args:
+        ray_origin (torch.Tensor): The point of origin of the ray (reflection point) [B, 4]
+        ray_direction (torch.Tensor): The direction of the ray (normalized) [B, 4]
+        plane_center (torch.Tensor): A point on the plane (center point) [B, 4]
+        plane_normal (torch.Tensor): Normal vector of the plane (normalized) [B, 4]
+        
+    Returns:
+        torch.Tensor: Intersection point in ENU-coordinates [B, 4]
+        torch.Tensor: Distance from ray_origin to intersection point in meter [B, 4]
+    """
+    # Convert all inputs to float64 for maximum precision
+    ray_origin = ray_origin.to(dtype=torch.float64)
+    ray_direction = ray_direction.to(dtype=torch.float64)
+    plane_center = plane_center.to(dtype=torch.float64)
+    plane_normal = plane_normal.to(dtype=torch.float64)
+    
+    # Normalize vectors if they aren't already (using float64 precision)
+    ray_direction = ray_direction / torch.norm(ray_direction, dim=-1, keepdim=True, dtype=torch.float64)
+    plane_normal = plane_normal / torch.norm(plane_normal, dim=-1, keepdim=True, dtype=torch.float64)
+    
+    # Calculate the vector from ray origin to plane center (in float64)
+    ray_to_plane = plane_center - ray_origin
+    
+    # Calculate the denominator (dot product of ray direction and plane normal)
+    denominator = torch.sum(ray_direction * plane_normal, dim=-1, keepdim=True)
+    
+    # Calculate the distance along the ray to the intersection point
+    # t = (ray_to_plane • plane_normal) / (ray_direction • plane_normal)
+    t = torch.sum(ray_to_plane * plane_normal, dim=-1, keepdim=True) / denominator
+    
+    # Calculate the intersection point (maintaining float64 precision)
+    intersection_point = ray_origin + t * ray_direction
+    
+    return intersection_point, t
 
 def enu_point_to_target_plane(
         enu_point: torch.Tensor,
@@ -271,6 +270,41 @@ def percentage_near_max(image, threshold=1):
 
     else:
         raise TypeError("Input must be a PyTorch-Tensor!")
+
+def analyze_calibration_results(save_dir=None):
+    """
+    Analyze the results of a calibration run.
+    
+    Parameters
+    ----------
+    model_name : str
+        Name of the model
+    log_dir : str, optional
+        Directory where logs are saved
+    """
+    
+    # Create a TensorboardReader
+    reader = TensorboardReader(f'{save_dir}/log')
+    
+    # Get a summary of the final performance
+    summary = reader.create_performance_summary()
+    print("Performance Summary:")
+    print(summary)
+    
+    plot_dir = f'{save_dir}/plots'
+    os.makedirs(plot_dir, exist_ok=True)
+    # Plot the loss curves
+    loss_fig = reader.plot_losses(modes=['Train', 'Validation'])
+    loss_fig.savefig(f'{plot_dir}/01_loss_over_epochs.png')
+    
+    # Plot alignment errors
+    error_fig = reader.plot_metrics(metric_name='AlignmentErrors_mrad', modes=['Train', 'Validation'])
+    error_fig.savefig(f'{plot_dir}/02_error_over_epochs.png')
+    
+    # Plot final error distribution
+    # TODO: Here create plot for sun distribution
+    # dist_fig = reader.visualize_final_error_distribution()
+    # dist_fig.savefig(f'{plot_dir}/03_error_distribution.png')
 
 def print_gpu_memory_usage(device, location=''):
     """Monitor GPU memory usage"""

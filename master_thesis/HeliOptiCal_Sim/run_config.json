@@ -1,26 +1,99 @@
 {
     "run": {
-        "scenario_path": "/dss/dsshome1/05/di38kid/data/scenarios/20250325_scenario_7heliostats.h5",
+        "scenario_path": "/dss/dsshome1/05/di38kid/data/scenarios/20250525_scenario_20_heliostats.h5",
         "heliostats": ["AA39", "AC27", "AD43", "AM35", "BB72", "BG24"],
-        "paint_dir": "/dss/dsshome1/05/di38kid/data/simulated_data/02", 
-        "num_epochs": 500,
-        "use_raytracing": 0,
+        "paint_dir": "/dss/dsshome1/05/di38kid/data/simulated_data/20Heliostats/20Heliostats_no_blocking", 
+        "use_raytracing": 1,
+        "use_ideal_flux_centers": 0, 
+        "log_steps": 10,
         "random_seed": 42,
         "device": "cuda:0"
     },
     "model": {
-        "init_learning_rate": [0.0005],
-        "parameter_grouping": [],
+        "num_epochs": 5000,
+        "init_learning_rate": [0.0001],
+        "max_lr": [1.0],
+        "min_lr": [0.000005],
+        "lr_factor": 0.5,
+        "lr_patience": 10,
+        "parameter_grouping": [],        
+        "phase_parameter_learning": {
+    },
         "optimizer_type": "Adam",
-        "scheduler_type": "ReduceLROnPlateau",
-        "max_lr": 0.1,
-        "loss": "mse"
+        "scheduler_type": "CyclicLR",
+        "warmup_lr_factor": 0.5,
+        "warmup_epochs": 1000
     },
     "splits": {
-        "path_to_measurements": "/dss/dsshome1/05/di38kid/data/paint/metadata/calibration_metadata_selected_heliostats_20250325_150310.csv",
+        "path_to_measurements": "/dss/dsshome1/05/di38kid/data/paint/selected_20/metadata/calibration_metadata_selected_heliostats_20250525_161028.csv",
         "output_dir": "/dss/dsshome1/05/di38kid/data/results",
         "training_sizes": [30],
         "validation_sizes": [30],
         "split_types": ["knn"]
-    }
+    },
+    "error_config": {
+        "all_heliostats_position_params": {
+            "heliostat_e": 0.2,  
+            "heliostat_n": 0.2,  
+            "heliostat_u": 0.2
+        },
+        "all_deviations_params": {
+            "first_joint_translation_e": 0.1,
+            "first_joint_translation_n": 0.1,
+            "first_joint_translation_u": 0.1,
+            "second_joint_translation_e": 0.1,
+            "second_joint_translation_n": 0.1,
+            "second_joint_translation_u": 0.1,
+            "concentrator_translation_e": 0.1,
+            "concentrator_translation_n": 0.1,
+            "concentrator_translation_u": 0.1,
+            "first_joint_tilt_n": 0.01,
+            "first_joint_tilt_u": 0.01,
+            "second_joint_tilt_e": 0.01,
+            "second_joint_tilt_n": 0.01,
+            "concentrator_tilt_e": 0.01,
+            "concentrator_tilt_n": 0.01,
+            "concentrator_tilt_u": 0.01
+        },
+        "all_actuators_params": {
+            "actuators_increments": 0, 
+            "actuators_initial_stroke_lengths": 0.05,
+            "actuators_offsets": 0.05,
+            "actuators_pivot_radii": 0.005,
+            "actuators_initial_angles": 0.005
+        }
+    },
+    "freeze_parameters": 
+        [ 
+        ],
+
+    "all_parameters": 
+        [
+            "heliostat_e",
+            "heliostat_n",
+            "heliostat_u",
+            "first_joint_translation_e",
+            "first_joint_translation_n",
+            "first_joint_translation_u",
+            "second_joint_translation_e",
+            "second_joint_translation_n",
+            "second_joint_translation_u",
+            "concentrator_translation_e",
+            "concentrator_translation_n",
+            "concentrator_translation_u",
+            "first_joint_tilt_e",
+            "first_joint_tilt_n",
+            "first_joint_tilt_u",
+            "second_joint_tilt_e",
+            "second_joint_tilt_n",
+            "second_joint_tilt_u",
+            "concentrator_tilt_e",
+            "concentrator_tilt_n",
+            "concentrator_tilt_u",
+            "actuators_increments",
+            "actuators_initial_stroke_lengths",
+            "actuators_offsets",
+            "actuators_pivot_radii",
+            "actuators_initial_angles"
+        ]
 }
