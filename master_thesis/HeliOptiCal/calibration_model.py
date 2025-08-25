@@ -1,8 +1,16 @@
+"""
+This module defines the `CalibrationModel` class, which represents a heliostat calibration model.
+It includes methods for initializing the model, configuring optimizers and schedulers, loading scenarios,
+and performing calibration tasks. The model is designed to work with the ARTIST framework for ray tracing
+and heliostat field simulation.
+
+Dependencies:
+- PyTorch for deep learning and optimization
+- ARTIST framework for ray tracing and scenario management
+- Various utility modules for data processing, logging, and plotting
+"""
 import torch
 import torch.nn as nn
-from torch.profiler import ProfilerActivity 
-from torch.utils.tensorboard import SummaryWriter 
-# import tensorflow.summary as summary
 import logging
 import sys
 import os
@@ -10,26 +18,20 @@ import re
 import json
 import scipy
 import copy
-
 from datetime import datetime
-from torchmetrics.image import StructuralSimilarityIndexMeasure
 from typing import Union, Literal, List, Tuple, Dict, Optional
 from pathlib import Path
 
-# parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-# if parent_path not in sys.path:
-#     sys.path.append(parent_path) 
 
 # Add local artist path for raytracing with multiple parallel heliostats.
 repo_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/artist'))
-sys.path.insert(0, repo_path) 
+sys.path.insert(0, repo_path)
 from artist.util.scenario import Scenario
 from artist.raytracing import raytracing_utils
 from artist.raytracing.heliostat_tracing import HeliostatRayTracer
-from artist.util import utils
 from artist.util.utils import get_center_of_mass
 
-# Add local artist path for raytracing with multiple parallel heliostats.
+# Import local modules
 repo_path = os.path.abspath(os.path.dirname('/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal'))
 sys.path.insert(0, repo_path)
 import HeliOptiCal.utils.my_config_dict as my_config_dict
@@ -49,79 +51,97 @@ from HeliOptiCal.plot_results.plot_errors_distributions import analyze_heliostat
 from HeliOptiCal.image_losses.image_loss import find_soft_contour_pytorch_vertical, sdf_loss, chamfer_distance_batch_optimized, dice_loss
 from HeliOptiCal.utils.util_simulate import gaussian_filter_2d
 
+# Configure logging
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
 logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] - [%(name)s] - [%(levelname)s] - [%(message)s]')
-# A logger for the CalibrationModel.
 
 
 class CalibrationModel(nn.Module):
     """
     A class to represent a Heliostat Calibration Model.
 
-    Attributes
-    ----------
-    name : str
-        Name used for storing model data.
+    This class is designed to calibrate heliostat fields using ray tracing and optimization techniques.
+    It supports various configurations for optimizers, schedulers, and data loaders.
 
-    Methods
-    -------
-
+    Attributes:
+        run_config (Dict): Configuration dictionary for the model.
+        name (str): Name of the model instance.
+        save_directory (Path): Directory to save model outputs.
+        tb_logger (TensorboardLogger): Logger for TensorBoard.
+        val_error_history (List): History of validation errors.
+        device (str): Device to run the model on (e.g., 'cpu' or 'cuda').
+        scenario (Scenario): ARTIST scenario object.
+        target_areas (Dict): Target areas in the scenario.
+        heliostat_ids (List): List of heliostat IDs in the field.
+        use_raytracing (bool): Whether to use ray tracing.
+        raytracer (HeliostatRayTracer): Ray tracer instance.
+        learnable_params_dict (Dict): Dictionary of learnable parameters.
+        optimizer (torch.optim.Optimizer): Optimizer for training.
+        schedulers (torch.optim.lr_scheduler): Learning rate schedulers.
+        datasplitter (CalibrationDataSplitter): Data splitter for calibration datasets.
+        dataloader (CalibrationDataLoader): Data loader for calibration datasets.
     """
-    def __init__(self, run_config: Dict[str, Dict]):
+    def __init__(self, run_config: Dict[str, Dict]) -> None:
         """
-        Inialize a Heliostat Calibration Model.
-        
-        Parameters
-        ----------
-        config : Dict
-            The run-config dictionary for a Heliostat Calibration Model.
-        """        
+        Initialize a Heliostat Calibration Model.
+
+        Parameters:
+            run_config (Dict): Configuration dictionary for the model.
+        """
         super(CalibrationModel, self).__init__()
         
         # Perform general model configurations
         self.run_config = run_config  # save for later usage
         general_config = run_config[my_config_dict.run_config_general]
 
-        self.name = f"run_{datetime.now().strftime('%y%m%d%H%M')}_{general_config[my_config_dict.general_name]}" 
-        # self.name = name
+        # Set the model name and save directory
+        self.name = f"run_{datetime.now().strftime('%y%m%d%H%M')}_{general_config[my_config_dict.general_name]}"
         log.info(f"Initializing a Heliostat Calibration Model: {self.name}")
         self.save_directory = Path(general_config[my_config_dict.general_save_to_directory]) / self.name
-        # self.save_directory = Path(self.name)
+
+        # Initialize attributes
         self.tb_logger = None  # later set logger for present run
-        
         self.val_error_history = []  # log average mean validation error
-        
         self.device = general_config[my_config_dict.general_device]
     
-        # Load the scenario
+        # Load the scenario and target areas
         self.scenario, self.target_areas = self.load_scenario(general_config[my_config_dict.general_scenario_path])
         self.heliostat_ids = self.scenario.heliostat_field.all_heliostat_names
-        
-        # Initiate Raytracer
+
+        # Initialize Raytracer
         self.use_raytracing = bool(general_config[my_config_dict.general_use_raytracing])
         self.raytracer = self.init_raytraycer(self.scenario)
         log.info("Done with Scenario loading and HeliostatRayTracer setup.")
         
-        # Perform configurations for model
+        # Configure the model
         model_config = run_config[my_config_dict.run_config_model]
         self.learnable_params_dict, parameter_count, element_count = (get_rigid_body_kinematic_parameters_from_scenario(
                 kinematic=self.scenario.heliostat_field.rigid_body_kinematic))
         log.info(f"Found number of parameters and elements: {parameter_count}, {element_count}")
-        
+
+        # Configure the optimizer and schedulers
         self.optimizer = self.configure_optimizer(model_config)
         self.schedulers = self.configure_schedulers(model_config)
         log.info("Done with optimizer and scheduler setup.")
-        
+
+        # Configure the data loader
         self.datasplitter, self.dataloader = self.configure_dataloader(run_config[my_config_dict.run_config_dataset])
         log.info("Done with data loading data splits.")
+
+        # Save the run configuration to a JSON file
         json.dump(run_config, open(self.save_directory / 'run_config.json', 'w+'), indent=4)
         
-    def load_scenario(self, scenario_path: Union[str, Path]):
+    def load_scenario(self, scenario_path: Union[str, Path]) -> Tuple[Scenario, Dict[str, object]]:
         """
-        Load and return an `ARTIST` Scenario.
+        Load and return an ARTIST Scenario.
+
+        Parameters:
+            scenario_path (Union[str, Path]): Path to the scenario file.
+
+        Returns:
+            Tuple[Scenario, Dict]: Loaded scenario and target areas.
         """
-        # TODO: Manipulate scenario if errors are configured
         if not os.path.exists(scenario_path):
             raise FileNotFoundError(f"Scenario file not found at path: {scenario_path}")
 
@@ -133,7 +153,7 @@ class CalibrationModel(nn.Module):
                 device=self.device
             )
 
-        # Add errors to kinematic model
+        # Add random errors to the kinematic model if configured
         if bool(self.run_config[my_config_dict.run_config_general][my_config_dict.general_introduce_random_errors]):
             from HeliOptiCal.utils.util_errors import add_random_errors_to_kinematic
             error_config = self.run_config[my_config_dict.run_config_initial_errors]
@@ -146,29 +166,41 @@ class CalibrationModel(nn.Module):
         target_areas = {area.name: area for area in loaded_scenario.target_areas.target_area_list}
         return loaded_scenario, target_areas
     
-    def init_raytraycer(self, scenario: Scenario, world_size=1, rank=0, batch_size=1, random_seed=42, bitmap_resolution=(256, 256)):
+    def init_raytraycer(self, scenario: Scenario, world_size=1, rank=0, batch_size=1, random_seed=42, bitmap_resolution=(256, 256)) -> HeliostatRayTracer:
         """
-        Iniitiate and return a HeliostatRayTracer.
+        Initialize and return a HeliostatRayTracer.
+
+        Parameters:
+            scenario (Scenario): ARTIST scenario object.
+            world_size (int): Number of distributed processes (default: 1).
+            rank (int): Rank of the current process (default: 0).
+            batch_size (int): Batch size for ray tracing (default: 1).
+            random_seed (int): Random seed for reproducibility (default: 42).
+            bitmap_resolution (Tuple[int, int]): Resolution of the bitmap (default: (256, 256)).
+
+        Returns:
+            HeliostatRayTracer: Initialized ray tracer.
         """
         # Get the loss type configurations 
         loss_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config]
         loss_basis = loss_config[my_config_dict.general_loss_basis].lower()
         
-        # Perform sanity check for the given configurations for raytracer use and loss type
+        # Perform sanity checks for ray tracing and loss type
         if self.use_raytracing and ('orientation' in loss_basis):
             log.warning(f"use_raytracing is set to 'True' although your loss only considers Heliostat orientations."\
                 "Using the Raytracer results in a high demand on computing and increased runtime. Make sure that this is what you want.")
         elif not self.use_raytracing and not ('orientation' in loss_basis):
             raise TypeError(f"loss_basis is configured to {loss_basis} which requires flux outputs from Raytracing. Set use_raytracing to True.")
             
-        # Before raytracer setup, Heliostat field needs to be aligned
+        # Align heliostat field surfaces with the incident ray direction
         heliostat_field = scenario.heliostat_field
         heliostat_field.align_surfaces_with_incident_ray_direction(
             # initial alignment (direction does not matter)
             incident_ray_direction = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device),
             device=self.device
             )
-        
+
+        # Initialize the ray tracer
         raytracer = HeliostatRayTracer(scenario=scenario,
                                        world_size=world_size,
                                        rank=rank,
@@ -178,9 +210,15 @@ class CalibrationModel(nn.Module):
                                        bitmap_resolution_u=bitmap_resolution[1])
         return raytracer
     
-    def configure_optimizer(self, model_config: Dict):
+    def configure_optimizer(self, model_config: Dict) -> torch.optim.Optimizer:
         """
-        Configure optimizer using the config dictionary.
+        Configure and return the optimizer based on the model configuration.
+
+        Parameters:
+            model_config (Dict): Configuration dictionary for the model.
+
+        Returns:
+            torch.optim.Optimizer: Configured optimizer.
         """
         optimizer_type = model_config[my_config_dict.model_optimizer]
         params = self.learnable_params_dict.parameters()
@@ -239,11 +277,15 @@ class CalibrationModel(nn.Module):
 
         return optimizer
     
-    def configure_schedulers(self, model_config: Dict):
+    def configure_schedulers(self, model_config: Dict) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
         """
-        Configure and return a learning rate scheduler.
-        If multiple schedulers are defined, returns a SequentialLR.
-        If one scheduler is defined, returns it directly.
+        Configure and return learning rate schedulers based on the model configuration.
+
+        Parameters:
+            model_config (Dict): Configuration dictionary for the model.
+
+        Returns:
+            torch.optim.lr_scheduler: Configured learning rate scheduler(s).
         """
         optimizer = self.optimizer
         initial_lr = model_config[my_config_dict.model_initial_lr]
@@ -356,9 +398,15 @@ class CalibrationModel(nn.Module):
                                                      schedulers=schedulers,
                                                      milestones=milestones)
         
-    def configure_dataloader(self, dataset_config: Dict):
+    def configure_dataloader(self, dataset_config: Dict) -> Tuple[CalibrationDataSplitter, CalibrationDataLoader]:
         """
-        
+        Configure and return the data splitter and data loader.
+
+        Parameters:
+            dataset_config (Dict): Configuration dictionary for the dataset.
+
+        Returns:
+            Tuple[CalibrationDataSplitter, CalibrationDataLoader]: Configured data splitter and data loader.
         """
         # Perform datasplits
         data_splitter = CalibrationDataSplitter(
@@ -371,6 +419,7 @@ class CalibrationModel(nn.Module):
             split_types=dataset_config[my_config_dict.dataset_split_types],
             save_splits_plots=True
         )
+
         # Configure dataloader for training
         calibration_data_loader = CalibrationDataLoader(
             data_directory=dataset_config[my_config_dict.dataset_training_data_directory],
@@ -384,12 +433,21 @@ class CalibrationModel(nn.Module):
             device=dataset_config[my_config_dict.dataset_device]
         )
         return data_splitter, calibration_data_loader
-    
-    def calibrate(self, blocking=0, device: Optional[Union[torch.device, str]] = None):
+
+    def calibrate(self, device: Optional[Union[torch.device, str]] = None) -> None:
         """
-        WARNING: This method does not yet allow calibrating for multiple splits. 
-        Re-initialize a new CalibrationModel instance for each split. 
-        """ 
+        Run end‑to‑end calibration across all configured dataset splits.
+
+        The routine iterates over each split (train/validation/test) produced by
+        `CalibrationDataSplitter`, performs phased/frozen training as configured,
+        logs metrics and artifacts to TensorBoard, tracks the best validation state,
+        and finally evaluates on the test set.
+
+        Parameters
+        ----------
+        device : torch.device or str, optional
+            Torch device to use. If None, falls back to `self.device`.
+        """
         device = torch.device(self.device if device is None else device)
         # Sum of scheduled epochs
         max_epochs = sum(self.run_config[my_config_dict.run_config_model][my_config_dict.model_epochs_sequence])
@@ -508,9 +566,29 @@ class CalibrationModel(nn.Module):
                 
                 self.tb_logger.close()
      
-    def forward(self, field_batch: List[Dict[str, Union[torch.Tensor, str]]], device: Optional[Union[torch.device, str]] = None):
+    def forward(self, field_batch: List[Dict[str, Union[torch.Tensor, str]]], device: Optional[Union[torch.device, str]] = None) -> Tuple[torch.Tensor]:
         """
-        Generate model output based on the given input data.
+        Forward pass to produce per‑sample heliostat orientations and (optionally)
+        ray‑traced flux bitmaps.
+
+        Parameters
+        ----------
+        field_batch : list of dict
+            Batch of field samples. Each dict contains (per sample):
+            - motor positions  (key: my_config_dict.field_sample_motor_positions)
+            - incident ray directions (key: my_config_dict.field_sample_incident_rays)
+            - target area names (key: my_config_dict.field_sample_target_names)
+        device : torch.device or str, optional
+            Torch device to use. If None, falls back to `self.device`.
+
+        Returns
+        -------
+        field_orientations : torch.Tensor
+            Shape [B, H, 4, 4]. Homogeneous transforms of each heliostat per batch
+            sample (B = batch size, H = number of heliostats).
+        pred_flux_bitmaps : torch.Tensor
+            Shape [B, H, He, Hu]. Predicted flux images if `self.use_raytracing` is
+            True; zeros otherwise. Resolution equals raytracer bitmap resolution.
         """
         device = torch.device(self.device if device is None else device)
         
@@ -545,9 +623,48 @@ class CalibrationModel(nn.Module):
                 pred_flux_bitmaps[sample] = sample_flux_bitmaps
         return field_orientations, pred_flux_bitmaps
     
-    def evaluate_model(self, epoch: int, orientations: torch.Tensor, pred_flux_bitmaps: torch.Tensor, field_batch: List[Dict]):
+    def evaluate_model(self, epoch: int, orientations: torch.Tensor, pred_flux_bitmaps: torch.Tensor, field_batch: List[Dict]) -> Tuple[torch.Tensor]:
         """
-        
+        Compute the training objective (scalar loss) and evaluation metrics for a batch.
+
+        Workflow
+        --------
+        1) Build ground‑truth reflection directions from measured (or COM‑derived)
+           flux centers. If simulated data provides ideal centers, optionally use
+           them as loss ground truth (config‑dependent), but **never** for the
+           evaluation metric.
+        2) Build predicted reflection directions either
+           (a) from model orientations and incident rays, or
+           (b) from predicted flux centers (COM) if `loss_basis` = center_of_mass.
+           Empty predicted flux bitmaps automatically fall back to (a).
+        3) Compute alignment‑loss per heliostat from cosine similarities.
+        4) If contour loss is enabled (and past warmup), compute fine/coarse/center
+           image losses, blend them with a soft transition, and apply a guardrail
+           that reverts to alignment loss for diverging heliostats.
+
+        Parameters
+        ----------
+        epoch : int
+            Global training epoch index.
+        orientations : torch.Tensor
+            Shape [B, H, 4, 4]. Homogeneous transforms of each heliostat.
+        pred_flux_bitmaps : torch.Tensor
+            Shape [B, H, He, Hu]. Predicted flux images (normalized upstream).
+        field_batch : list of dict
+            Batch entries holding incident rays, target names, flux images and/or
+            flux centers; simulated data may additionally hold ideal centers.
+
+        Returns
+        -------
+        loss : torch.Tensor
+            Scalar mean loss over heliostats (averaged from per‑heliostat guardrail
+            loss).
+        eval_alignment_errors : torch.Tensor
+            Shape [B, H] in mrad. Alignment errors between **predicted vs. measured**
+            reflection directions (evaluation metric).
+        actual_alignment_errors : torch.Tensor
+            Shape [B, H] in mrad. Only for simulated data: alignment errors between
+            **predicted vs. ideal** reflection directions; zeros otherwise.
         """
         # TODO: Normalize true and predicted Bitmaps!
         # Get nested list of target area names and stacked Tensor of incident ray directions from batch data
@@ -637,25 +754,24 @@ class CalibrationModel(nn.Module):
                 
         return guardrail_loss.mean(), eval_alignment_errors, actual_alignment_errors
 
-    def check_early_stopping(self, val_alignment_errors: torch.Tensor, stop_1: 0.5, stop_2: 0.05):
+    def check_early_stopping(self, val_alignment_errors: torch.Tensor, stop_1: float=0.5, stop_2: float=0.05) -> bool:
         """
-        Evaluate early stopping criteria based on validation alignment errors.
-        
+        Evaluate early‑stopping conditions from validation alignment errors.
+
         Parameters
         ----------
         val_alignment_errors : torch.Tensor
-            Tensor of shape [B, H] with alignment errors in mrad.
-        epoch : int
-            Current training epoch.
+            Shape [B, H] (mrad). Validation batch alignment errors.
         stop_1 : float
-            Threshold value for worst-performing heliostat which triggers early stopping (Default: 0.5)
+            Threshold on worst mean heliostat error to stop early.
         stop_2 : float
-            Threshold value for minimum improvement in mean validation error over last 100 epochs which triggers early stopping (Default: 0.05)
-            
+            Minimum required improvement of mean validation error over the recent
+            window (fixed length) to continue; otherwise stop.
+
         Returns
         -------
-        stop : bool
-            True if early stopping should be triggered.
+        bool
+            True if an early‑stopping criterion is met; False otherwise.
         """
         # Compute mean alignment error per heliostat [H]
         mean_error_per_heliostat = val_alignment_errors.mean(dim=0)  # shape: [H]
@@ -677,10 +793,38 @@ class CalibrationModel(nn.Module):
         return False
         
     def soft_loss_transition(self, alignment_loss: torch.Tensor, fine_contour_loss: torch.Tensor, coarse_contour_loss: torch.Tensor, center_loss: torch.Tensor,
-                             epoch: int, beta: float=0.6, omega: float=0.05, gamma: float=0.2):
+                             epoch: int, beta: float=0.6, omega: float=0.05, gamma: float=0.2) -> torch.Tensor:
         """
-        Combine three loss input Tensor to one single loss using a soft transition from alignment loss to contour loss terms.
-        """ 
+        Blend alignment and contour‑based losses with a two‑phase schedule.
+
+        During warmup → midpoint, linearly increase the contour contribution.
+        After midpoint, use a fixed mixture of fine/coarse contour losses plus a
+        small alignment regularizer. Optionally add a center‑of‑mass term.
+
+        Parameters
+        ----------
+        alignment_loss : torch.Tensor
+            Shape [H]. Per‑heliostat alignment loss.
+        fine_contour_loss : torch.Tensor
+            Shape [H]. Loss that assumes overlapping contours (fine alignment).
+        coarse_contour_loss : torch.Tensor
+            Shape [H]. Loss robust to non‑overlapping contours (coarser stage).
+        center_loss : torch.Tensor
+            Shape [H]. Optional COM‑distance term (per heliostat).
+        epoch : int
+            Global epoch, used to compute the blending coefficient.
+        beta : float
+            Weight between fine/coarse contour losses (coarse weight = beta).
+        omega : float
+            Weight for center‑of‑mass loss (if enabled).
+        gamma : float
+            Residual weight for the alignment loss.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [H]. Blended loss per heliostat.
+        """
         assert alignment_loss.shape == fine_contour_loss.shape, \
             f"Loss terms need to have equal shapes, but have {alignment_loss.shape}, {fine_contour_loss.shape}"
         assert alignment_loss.shape == coarse_contour_loss.shape, \
@@ -713,36 +857,60 @@ class CalibrationModel(nn.Module):
             self.tb_logger.log_loss(f"ContourLoss{coarse_loss_key}", coarse_contour_loss.mean().item(), epoch)                    
         return combined_loss
     
-    def guardrail_loss(self, alignment_errors: torch.Tensor, combined_loss: torch.Tensor, alignment_loss: torch.Tensor, threshold=8.0):
+    def guardrail_loss(self, alignment_errors: torch.Tensor, combined_loss: torch.Tensor, alignment_loss: torch.Tensor, threshold=8.0) -> torch.Tensor:
         """
-        Use alignemnt_loss as fallback loss term if a Heliostat violates the threshold average alignment error.
+        Guardrail: revert to alignment loss for heliostats with large mean errors.
+
+        Parameters
+        ----------
+        alignment_errors : torch.Tensor
+            Shape [B, H] (mrad). Per‑sample per‑heliostat evaluation errors.
+        combined_loss : torch.Tensor
+            Shape [H]. Current mixed loss per heliostat.
+        alignment_loss : torch.Tensor
+            Shape [H]. Alignment loss per heliostat to fall back to.
+        threshold : float
+            Mean error threshold (mrad) above which the guardrail activates.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [H]. Final per‑heliostat loss after the guardrail switch.
         """
         H = len(self.heliostat_ids)
         assert combined_loss.shape == alignment_loss.shape, \
             f"Loss terms need to have equal shapes, but have {combined_loss.shape}, {alignment_loss.shape}"
         assert H == combined_loss.shape[0] == alignment_loss.shape[0] == alignment_errors.shape[1], \
             f"Loss terms need be per Heliostat and given as shape [H] = {H}"
-        
+
         # Take mean for each Heliostat
         alignment_errors = alignment_errors.mean(dim=0)  # shape [H]
-        
+
         # Determine fallback mask based on alignment errors
         fallback_mask = (alignment_errors > threshold)
-        
+
         # Apply fallback where alignment error too high
-        guardrail_loss = torch.where(fallback_mask, alignment_loss, combined_loss)    
+        guardrail_loss = torch.where(fallback_mask, alignment_loss, combined_loss)
         return guardrail_loss
         
-    def calc_alignment_loss(self, cosine_similarities: torch.Tensor):
+    def calc_alignment_loss(self, cosine_similarities: torch.Tensor) -> torch.Tensor:
         """
-        Calculate loss from cosine similarities for each heliostat independently.
+        Map cosine similarities to a per‑heliostat loss according to config.
 
-        Args:
-            cosine_similarities (torch.Tensor): Tensor of shape [B, H_idx], values in [-1.0, 1.0]
+        Supported loss types (case‑insensitive):
+        - 'MAE'/'L1', 'MSE'/'L2', 'MAX' (L∞), 'HUBER[-_<δ>]', 'QUANTILE'/'PERCENTILE'[-_<q>]
 
-        Returns:
-            torch.Tensor: Tensor with mean loss values per Heliostat in field [H_idx]        
-        """       
+        Parameters
+        ----------
+        cosine_similarities : torch.Tensor
+            Shape [B, H], values in [-1, 1].
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [H]. Per‑heliostat loss averaged over batch (or the chosen
+            statistic for MAX/QUANTILE).
+        """
         # Add scaling factor for loss
         sf_loss = 1e6
         
@@ -790,24 +958,42 @@ class CalibrationModel(nn.Module):
         return loss_per_heliostat
     
     def calc_contour_loss(self, pred_bitmaps: torch.Tensor, true_bitmaps: torch.Tensor, target_areas, epoch, 
-                          threshold=0.6, sharpness=70.0, num_interpolate=4, sigma_in=15.0, sigma_out=25.0):    
+                          threshold=0.6, sharpness=70.0, num_interpolate=4, sigma_in=15.0, sigma_out=25.0) -> Tuple[torch.Tensor]:
         """
-        Attempts to find upper contours of both predicted and true flux bitmaps. 
-        Then calculate image loss on found contours per Heliostat.
-        
-        Args:
-            pred_bitmaps (torch.Tensor): Tensor of shape [B, H_idx, H, W]
-            true_bitmaps (torch.Tensor): Tensor of shape [B, H_idx, H, W]
-            threshold (float): Threshold for pixel-detection in contour search
-            sharpness (float): Sharpness factor for contour post-processing
-            num_interpolate (int): Number of interpolations for input images and contour images (pre- annd post-processing)
-            sigma_in (float): Std. for Gaussian filter on image pre-processing
-            sigma_out (float): Std. for  Gaussian filter on contour post-processing
-            
-        Returns:
-            torch.Tensor: Tensor with mean loss values per Heliostat in field [H_idx]   
+        Compute image‑based losses from upper contours of predicted and true flux images.
+
+        For each heliostat:
+        1) Pre‑smooth, extract upper contours with a soft detector, post‑smooth.
+        2) Compute a fine‑alignment loss (requiring overlap) and a coarse loss
+           (robust when contours do not overlap).
+        3) Optionally compute a COM distance between predicted vs. true contours.
+
+        Parameters
+        ----------
+        pred_bitmaps, true_bitmaps : torch.Tensor
+            Shape [B, H, He, Hu]. Predicted and ground‑truth flux images.
+        target_areas : list[list[str]]
+            Nested list of target names per sample used for COM computation.
+        epoch : int
+            Global epoch for logging.
+        threshold : float
+            Soft threshold for contour detection.
+        sharpness : float
+            Steepness parameter for soft contour extraction.
+        num_interpolate : int
+            Pre/post up‑down sampling count for smoothing continuity.
+        sigma_in, sigma_out : float
+            Gaussian blur std dev before and after contour detection.
+
+        Returns
+        -------
+        fine_loss : torch.Tensor
+            Shape [H]. Fine contour loss per heliostat.
+        coarse_loss : torch.Tensor
+            Shape [H]. Coarse contour loss per heliostat.
+        center_loss : torch.Tensor
+            Shape [H]. Optional COM loss per heliostat (zeros if disabled).
         """
-        # TODO: Finish this function.
         assert pred_bitmaps.shape == true_bitmaps.shape, \
             f"pred_bitmaps and true_bitmaps must have equal shapes, but have {pred_bitmaps.shape} and {true_bitmaps.shape}"
         
@@ -879,9 +1065,23 @@ class CalibrationModel(nn.Module):
         del all_true_contours
         return fine_loss_per_heliostat, coarse_loss_per_heliostat, center_loss_per_heliostat
     
-    def calc_center_mass_loss(self, images1: torch.Tensor, images2: torch.Tensor, target_areas_names: List[str], threshold=0.1):
+    def calc_center_mass_loss(self, images1: torch.Tensor, images2: torch.Tensor, target_areas_names: List[str], threshold=0.1) -> torch.Tensor:
         """
-        Calculate the mean loss on center of mass corrdinates between the two input image batches.
+        Distance between centers of mass (COM) of two contour (or flux) images.
+
+        Parameters
+        ----------
+        images1, images2 : torch.Tensor
+            Shape [B, He, Hu], normalized to [0, 1]. Must have identical shape.
+        target_areas_names : list[str]
+            Target IDs for each sample to resolve plane bases and centers.
+        threshold : float
+            Minimum intensity used in COM computation.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar mean L2 distance between COMs over the batch.
         """
         assert images1.shape == images2.shape
         device = images1.device
@@ -906,9 +1106,23 @@ class CalibrationModel(nn.Module):
         centers2_tensor = torch.stack(center_of_mass2)
         return torch.mean(torch.norm(centers1_tensor - centers2_tensor, dim=1))
            
-    def calc_flux_centers_from_orientations(self, orientations: torch.Tensor, incident_ray_directions: torch.Tensor, target_area_names: List[List[str]]):
+    def calc_flux_centers_from_orientations(self, orientations: torch.Tensor, incident_ray_directions: torch.Tensor, target_area_names: List[List[str]]) -> torch.Tensor:
         """
-        
+        Intersect reflected rays with target planes to obtain flux center points.
+
+        Parameters
+        ----------
+        orientations : torch.Tensor
+            Shape [B, H, 4, 4]. Heliostat homogeneous transforms.
+        incident_ray_directions : torch.Tensor
+            Shape [B, H, 4]. Incoming ray directions (homogeneous).
+        target_area_names : list[list[str]]
+            Target identifiers per sample/heliostat to select plane definitions.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [B, H, 4]. Flux center points on the target planes (homogeneous).
         """
         # Initiate output Tensor
         device = orientations.device
@@ -938,21 +1152,22 @@ class CalibrationModel(nn.Module):
         return flux_centers
     
     @staticmethod
-    def calc_reflection_directions_from_orientations(incident_ray_directions: torch.Tensor, orientations: torch.Tensor):
+    def calc_reflection_directions_from_orientations(incident_ray_directions: torch.Tensor, orientations: torch.Tensor) -> torch.Tensor:
         """
-        Calculate reflected ray directions using incident ray directions and concentrator orientations.
+        Compute reflected ray directions from incident rays and heliostat normals.
 
         Parameters
         ----------
         incident_ray_directions : torch.Tensor
-            Tensor of shape [B, H, 4] containing the direction of incoming rays.
+            Shape [B, H, 4] or broadcastable. Incoming directions (homogeneous).
         orientations : torch.Tensor
-            Tensor of shape [B, H, 4, 4] representing the orientation matrices of heliostats.
+            Shape [B, H, 4, 4] or broadcastable. Homogeneous transforms; the z‑axis
+            (column 2) encodes the mirror normal in world coordinates.
 
         Returns
         -------
         torch.Tensor
-            Reflected ray directions of shape [B, H, 4], normalized and in ENU 4D format.
+            Shape [B, H, 4]. Reflected ray directions (homogeneous).
         """
         # Add dimensions if necessary
         while incident_ray_directions.dim() < 3:
@@ -969,9 +1184,32 @@ class CalibrationModel(nn.Module):
         reflected = incident_ray_directions - 2 * dot * normals  # [B, H, 4]
         return reflected
     
-    def calc_centers_of_mass(self, bitmaps: torch.Tensor, target_area_names: List[List[str]], threshold=0):
+    def calc_centers_of_mass(self, bitmaps: torch.Tensor, target_area_names: List[List[str]], threshold=0) -> torch.Tensor:
         """
-        Calculate and return the ENU-coordinates of the center of mass for a batch of bitmaps.
+        Compute the flux focal spot centers of mass (CoM) in ENU coordinates for a batch of flux images.
+
+        Each bitmap is processed relative to its assigned target area geometry, so that the pixel-based
+        center of mass is mapped into absolute 4D ENU coordinates. This enables consistent comparison of
+        measured and predicted flux centers across different heliostat–target configurations.
+
+        Parameters
+        ----------
+        bitmaps : torch.Tensor
+            Flux intensity images with shape [B, H, H_img, W_img], where B is the batch size and H the
+            number of heliostats. If fewer dimensions are provided, batch and/or heliostat dimensions
+            are automatically added.
+        target_area_names : List[List[str]]
+            Nested list of target area names per sample and heliostat (shape [B, H]).
+            Each name must correspond to an entry in `self.target_areas`.
+        threshold : float, optional
+            Intensity threshold applied when computing the center of mass. Pixels below this value
+            are ignored to suppress noise and background (default=0).
+
+        Returns
+        -------
+        centers_of_mass : torch.Tensor
+            Tensor of shape [B, H, 4], where each entry is the ENU 4D coordinate of the flux focal
+            spot center of mass for the respective heliostat and batch sample.
         """
         device = bitmaps.device
         
@@ -1012,9 +1250,22 @@ class CalibrationModel(nn.Module):
         return reflection_directions
     
     @staticmethod
-    def calc_cosine_similarities(pred_vector: torch.Tensor, true_vector: torch.Tensor, epsilon: float = 1e-10): 
+    def calc_cosine_similarities(pred_vector: torch.Tensor, true_vector: torch.Tensor, epsilon: float = 1e-10) -> torch.Tensor:
         """
-        
+        Cosine similarity between predicted and true direction vectors.
+
+        Parameters
+        ----------
+        pred_vector, true_vector : torch.Tensor
+            Shape [..., 4] or [..., 3] and broadcastable to [B, H, 4]. The last
+            component is ignored; vectors are reduced to 3D.
+        epsilon : float
+            Numerical stabilizer to avoid division by zero.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [B, H]. Cosine similarities in [-1, 1].
         """
         assert pred_vector.shape == true_vector.shape, 'Given pred_vector and true_vector must have identical shapes.'
         
@@ -1037,9 +1288,21 @@ class CalibrationModel(nn.Module):
         return cos_sim
     
     @staticmethod
-    def calc_alignment_errors_stable(pred_vector: torch.Tensor, true_vector: torch.Tensor, epsilon: float = 1e-12): 
+    def calc_alignment_errors_stable(pred_vector: torch.Tensor, true_vector: torch.Tensor, epsilon: float = 1e-12) -> torch.Tensor:
         """
-        
+        Angular misalignment (mrad) between direction vectors, numerically stable.
+
+        Parameters
+        ----------
+        pred_vector, true_vector : torch.Tensor
+            Shape [..., 4] or [..., 3] and broadcastable to [B, H, 4]. Reduced to 3D.
+        epsilon : float
+            Numerical stabilizer for robust acos input.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [B, H]. Angular error in milliradians.
         """
         assert pred_vector.shape == true_vector.shape, 'Given pred_vector and true_vector must have identical shapes.'
         
@@ -1068,9 +1331,34 @@ class CalibrationModel(nn.Module):
         return angles_rad * 1000  # in mrad
 
     @staticmethod
-    def find_upper_contour(bitmaps: torch.Tensor, threshold=0.6, sharpness=70.0, num_interpolate=4, sigma_in=20.0, sigma_out=25.0):
+    def find_upper_contour(bitmaps: torch.Tensor, threshold=0.6, sharpness=70.0, num_interpolate=4, sigma_in=20.0, sigma_out=25.0) -> torch.Tensor:
         """
-        Safely extract upper contours from flux bitmaps. Avoids in-place ops that break autograd.
+        Extract smoothed upper contours from flux bitmaps (autograd‑safe).
+
+        Pipeline
+        --------
+        1) Normalize + interpolate (anti‑alias smoothing).
+        2) Gaussian blur (sigma_in).
+        3) Soft vertical contour detection (threshold, sharpness).
+        4) Gaussian blur (sigma_out) and re‑interpolate + normalize.
+
+        Parameters
+        ----------
+        bitmaps : torch.Tensor
+            Shape [B, He, Hu] or [He, Hu] (broadcasted to [B, ...]).
+        threshold : float
+            Soft detection threshold in [0, 1].
+        sharpness : float
+            Slope parameter for the soft transition.
+        num_interpolate : int
+            Number of up/down interpolation cycles.
+        sigma_in, sigma_out : float
+            Standard deviations for input/contour Gaussian smoothing.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [B, He, Hu]. Upper‑contour bitmaps in [0, 1].
         """
         # 1. Normalize and interpolate for smoothing
         norm_bitmaps = normalize_and_interpolate(bitmaps, num_interpolate).squeeze(0)  # [B, H, W]
@@ -1089,39 +1377,27 @@ class CalibrationModel(nn.Module):
 
         output = torch.stack(smoothed_contours, dim=0)  # [B, H, W]
         interpolated = normalize_and_interpolate(output, num_interpolate).squeeze(0)
-        return interpolated    
+        return interpolated
     
+    def count_empty_flux_predictions(self, pred_flux_bitmaps: torch.Tensor, epoch: int, threshold=1) -> Tuple[torch.Tensor, int]:
         """
-    def calc_flux_image_loss(self, pred_flux_bitmpas: torch.Tensor, true_flux_bitmaps: torch.Tensor):
-        """
-        
-        """
-        loss_config = self.run_config[my_config_dict.run_config_general][my_config_dict.general_loss_config]
-        image_loss_key = loss_config[my_config_dict.general_flux_img_loss]
-        
-        if "contour" in image_loss_key:               
-                # Extracts upper contour bitmaps of both the true and predicted flux images
-                true_contour_bitmaps = self.extract_upper_contours(bitmaps=true_flux_bitmaps, threshold=0.5, num_interpolate=4)
-                pred_contour_bitmaps = self.extract_upper_contours(bitmaps=pred_flux_bitmaps, threshold=0.5, num_interpolate=4)
-                
-                diff_contour_bitmaps = pred_contour_bitmaps - true_contour_bitmaps
-                self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=true_contour_bitmaps, type='TrueContour')
-                self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=pred_contour_bitmaps, type='PredContour')
-                self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=diff_contour_bitmaps, type='DiffContour')
-                # Use coordinates of contour centers for alignment
-                true_flux_centers = self.calc_centers_of_mass(bitmaps=true_contour_bitmaps, target_area_names=target_areas)
-                pred_flux_centers = self.calc_centers_of_mass(bitmaps=pred_contour_bitmaps, target_area_names=target_areas)
-                
-        else:
-            raise ValueError(f"Unsupported mode for flux center predictions: {model_flux_center_predictions}")        
+        Count and flag empty predicted flux bitmaps.
 
-        return 
-        """
-    
-    def count_empty_flux_predictions(self, pred_flux_bitmaps: torch.Tensor, epoch: int, threshold=1):
-        """
-        Counts number of empty flux prediction samples in the input Bitmaps. Input needs to be normalized.
-        Returns mask for empty bitmaps and total count of empty instances.
+        Parameters
+        ----------
+        pred_flux_bitmaps : torch.Tensor
+            Shape [B, H, He, Hu]. Assumed normalized to [0, 1].
+        epoch : int
+            Current epoch for logging.
+        threshold : float
+            Minimum sum of pixel intensities to be considered non‑empty.
+
+        Returns
+        -------
+        empty_mask : torch.Tensor
+            Shape [B, H], boolean. True where a heliostat’s flux image is empty.
+        empty_count : int
+            Total number of empty (B, H) instances.
         """
         assert pred_flux_bitmaps.dim() > 2, \
             "Expected pred_flux_bitmaps to have at least 3 dimensions, not {pred_flux_bitmaps.dim()} dimensions."
@@ -1137,31 +1413,17 @@ class CalibrationModel(nn.Module):
                 log.info(f"{self.tb_logger.mode} Batch: Count of empty flux bitmap predictions: {empty_count} of {empty_mask.numel()}")
         return empty_mask, empty_count
     
-    def dist_loss_image_batch(self, true_flux_bitmap: torch.Tensor, pred_flux_bitmap: torch.Tensor, epoch: int):
+    def freeze_params(self, freeze_params: List[str] = [],  logging: bool=True) -> None:
         """
-        Calculate the distance 
-        """
-        assert true_flux_bitmap.shape == pred_flux_bitmap.shape, \
-            "Mismatch in shapes of true_flux_bitmap {true_flux_bitmap.shape} and pred_flux_bitmaps {pred_flux_bitmap.shape}."
-        
-        assert true_flux_bitmap.dim() == 2, "Expected input bitmaps to have 2 dimensions instead of {true_flux_bitmap.dim()}"       
-        
-        # Generate reference image       
-        with torch.no_grad():
-            reference_binary = (true_flux_bitmap > 0.01 * torch.max(true_flux_bitmap)).cpu().numpy()
-            distance_map_np = scipy.ndimage.distance_transform_edt(1 - reference_binary)
-            distance_map = torch.tensor(distance_map_np, device=true_flux_bitmap.device, dtype=torch.float32)
+        Freeze or unfreeze parameter groups in `self.learnable_params_dict`.
 
-        loss_dist = (pred_flux_bitmap * distance_map).sum()
-        
-        # self.tb_logger.log_loss('DistanceMap', loss_dist.item(), epoch)
-        # self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=true_flux_bitmap.unsqueeze(0).unsqueeze(0), type='TrueFlux')
-        # self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=pred_flux_bitmap.unsqueeze(0).unsqueeze(0), type='PredFlux')
-        # diff_image = normalize_images((pred_flux_bitmap - true_flux_bitmap).unsqueeze(0)).unsqueeze(0)
-        # self.tb_logger.log_flux_bitmaps(epoch=epoch, bitmaps=diff_image, type='DiffFlux')
-        return loss_dist
-    
-    def freeze_params(self, freeze_params: List[str] = [],  logging: bool=True):
+        Parameters
+        ----------
+        freeze_params : list[str]
+            Collection of group name substrings to freeze. All others are unfrozen.
+        logging : bool
+            If True, print which groups are frozen.
+        """
         # Iterate over the nested parameters and freeze / unfreeze
         # Names and parameter lists in the learnable parameters dict
         for name, param_group in self.learnable_params_dict.items():
@@ -1180,14 +1442,16 @@ class CalibrationModel(nn.Module):
                     params.requires_grad = grad
                     has_grad = params.requires_grad       
                     
-    def unfreeze_param_group(self, param_group: List[str]):
+    def unfreeze_param_group(self, param_group: List[str]) -> None:
         """
-        Unfreeze current parameter group, while freezing all other parameters.
-        
+        Unfreeze only parameters whose names match any substring in `param_group`.
+
+        All other groups are frozen (except those permanently frozen in config).
+
         Parameters
         ----------
-        param_group : List[str]
-            List of key-words for selecting those parameters which will be unfrozen for the current phase.
+        param_group : list[str]
+            Substrings to select the group(s) to unfreeze for the current phase.
         """
         model_params = list(self.learnable_params_dict.keys())
         # Never unfreeze selection of permanently frozen params
@@ -1201,10 +1465,21 @@ class CalibrationModel(nn.Module):
         
         self.freeze_params(freeze_params=list(freeze_params), logging=False)
     
-    def phase_freeze_training(self, current_epoch: int, phase_counter: int):
+    def phase_freeze_training(self, current_epoch: int, phase_counter: int) -> int:
         """
-        Method uses phased training, if configured.
-        The selection of frozen parameters will not be affected by phased training.
+        Phase‑based unfreezing according to config‑defined epochs and phase lengths.
+
+        Parameters
+        ----------
+        current_epoch : int
+            Global epoch index (resets internal phase counter at phase starts).
+        phase_counter : int
+            Rolling counter to select the next parameter group to unfreeze.
+
+        Returns
+        -------
+        int
+            Updated `phase_counter` for the calling training loop.
         """
         epochs_sequence = self.run_config[my_config_dict.run_config_model][my_config_dict.model_epochs_sequence]
         freeze_and_phase = self.run_config[my_config_dict.run_config_model][my_config_dict.model_apply_with_caution]
@@ -1238,30 +1513,41 @@ class CalibrationModel(nn.Module):
             # Move to next epoch sequence in lr scheduler
             epoch_accumulator += epochs
 
-    def update_best_parameters(self, best_metric: float, current_metric: torch.Tensor, best_state_dict: dict()):
+    def update_best_parameters(self, best_metric: float, current_metric: torch.Tensor, best_state_dict: dict()) -> Tuple[float, dict]:
         """
-        Update the best_state_dict with the current model parameters if current_metric is better.
-        
-        Args: 
-            best_metric (float): The best value of the validation metric so far (lower is better).
-            current_metric (torch.Tensor): The current epoch's validation metric (lower is better).
-            best_state_dict (dict): The current best model parameters (state_dict).
+        Track and store the best model state according to a validation metric.
 
-        Returns:
-            best_metric (float): Updated best metric.
-            best_state_dict (dict): Updated state_dict for the best model.
+        Parameters
+        ----------
+        best_metric : float
+            Best (lowest) metric value seen so far.
+        current_metric : torch.Tensor
+            Current (scalar) validation metric (lower is better).
+        best_state_dict : dict
+            Previously saved best `state_dict()`.
+
+        Returns
+        -------
+        best_metric : float
+        best_state_dict : dict
+            Updated best metric and a deep copy of the current `state_dict` when
+            improvement is observed; otherwise unchanged.
+
         """
         if not torch.isnan(current_metric) and (current_metric.item() < best_metric):
             best_metric = current_metric.item()
             best_state_dict = copy.deepcopy(self.state_dict())
         return best_metric, best_state_dict
 
-    def load_best_parameters(self, best_state_dict):
+    def load_best_parameters(self, best_state_dict) -> None:
         """
-        Load the best set of parameters into the model.
-        
-        Args:
-            best_state_dict (dict): The best parameters (from .state_dict()) to load.
+        Load a previously captured best `state_dict` into the model (if any).
+
+        Parameters
+        ----------
+        best_state_dict : dict or None
+            Saved parameter dictionary. If None, the call is a no‑op.
+
         """
         if best_state_dict is not None:
             self.load_state_dict(best_state_dict)
