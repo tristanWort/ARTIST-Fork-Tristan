@@ -27,7 +27,6 @@ if __name__ == '__main__':
     
     # job_folder = Path("/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/_jobs/_jobs_0630_6")
     config_path = [Path("/dss/dsshome1/05/di38kid/master_thesis/ARTIST-Fork-Tristan/master_thesis/HeliOptiCal/run_config.json")]
-    # blocking = 20
     
     # Iterate over all .json files in the folder
     # for json_file in job_folder.glob("*.json"):
